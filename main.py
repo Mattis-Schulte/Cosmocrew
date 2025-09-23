@@ -35,11 +35,11 @@ BATTERY_ADC_PIN = "A4"
 VBAT_MIN, VBAT_MAX = 5.4, 8.0
 BATTERY_POLL_SEC = 15
 
-OBSTACLE_THRESHOLD_CM = 8.0     # block forward below this
-OBSTACLE_CLEAR_CM = 9.5         # clear block above this (hysteresis)
+OBSTACLE_THRESHOLD_CM = 15.0     # block forward below this
+OBSTACLE_CLEAR_CM = 17.0         # clear block above this (hysteresis)
 OBSTACLE_POLL_SEC = 0.12
 
-LINEFOLLOW_BASE_SPEED = 42
+LINEFOLLOW_BASE_SPEED = 20
 
 # Photo folder
 try:
@@ -397,35 +397,26 @@ def prune_photos(max_photos=MAX_PHOTOS):
 def take_photo():
     name = f"photo_{strftime('%Y-%m-%d-%H-%M-%S', localtime(time()))}.jpg"
     path = os.path.join(PHOTO_FOLDER, name)
+
     if Vilib and hasattr(Vilib, "take_photo"):
         try:
-            res = Vilib.take_photo(name[:-4], PHOTO_FOLDER + "/")
-            if isinstance(res, str) and os.path.exists(res):
-                prune_photos()
-                return res
+            Vilib.take_photo(name[:-4], PHOTO_FOLDER + "/")
+
+            for _ in range(10):
+                if os.path.exists(path):
+                    return path
+                sleep(0.05)
+
+            prefix = os.path.splitext(name)[0]
+            candidates = [os.path.join(PHOTO_FOLDER, f) for f in os.listdir(PHOTO_FOLDER) if f.startswith(prefix)]
+            if candidates:
+                candidates.sort(key=os.path.getmtime, reverse=True)
+                return candidates[0]
+
+            log.info("Vilib saved no detectable file for %s", name)
+            return None
         except Exception as e:
             log.info("Vilib.take_photo failed (falling back): %s", e)
-    if not cv2:
-        return None
-    try:
-        cap = cv2.VideoCapture(0)
-        if not cap or not cap.isOpened():
-            if cap: cap.release()
-            return None
-        ok, frame = cap.read()
-        cap.release()
-        if not ok or frame is None:
-            return None
-        try:
-            cv2.imwrite(path, frame)
-            prune_photos()
-            return path
-        except Exception as e:
-            log.warning("cv2.imwrite failed: %s", e)
-            return None
-    except Exception as e:
-        log.info("OpenCV capture failed: %s", e)
-        return None
 
 # ---------- Automation: Obstacle monitor ----------
 class ObstacleMonitor:
@@ -487,11 +478,37 @@ obmon = ObstacleMonitor(px)
 
 # ---------- Automation: Line follower ----------
 class LineFollower:
+    # Tunables
+    _MAX_STEER = 100              # steer command limit [-100..100]
+    _GAP_MAX_SEC = 0.6           # max time to bridge short gaps
+    _CONF_THRESHOLD = 0.22       # confidence to consider the line seen (0..1)
+    _SEARCH_STEP_SEC = 0.5       # how long to hold each zig-zag direction
+    _SEARCH_AMP_RATE = 120.0     # steer units per second to grow amplitude in SEARCH
+    _STEER_SLEW = 400.0          # steer units per sec (slew rate)
+    _THR_SLEW = 300.0            # throttle units per sec (slew rate)
+    _KP = 70.0                   # PD proportional gain (steer units per error)
+    _KD = 25.0                   # PD derivative gain (steer units per error/sec)
+    _DT_MIN = 0.02               # clamp dt for stability
+    _DT_MAX = 0.2
+
     def __init__(self, picarx):
         self.px = picarx
         self._stop = Event()
         self._task = None
         self.running = False
+
+        # Advanced state
+        self._dark_line = None     # auto-detect polarity (dark-on-light vs light-on-dark)
+        self._prev_err = 0.0
+        self._last_thr = 0.0
+        self._last_steer = 0.0
+        self._last_seen_at = 0.0
+        self._last_seen_pos = 0.0  # last estimated error [-1..1]
+        self._mode = "FOLLOW"      # FOLLOW | GAP | SEARCH
+        self._search_dir = 1
+        self._search_amp = 12.0
+        self._search_hold_until = 0.0
+        self._last_ts = time()
 
     def is_running(self):
         return self.running
@@ -499,11 +516,26 @@ class LineFollower:
     def start(self):
         if self.running:
             return False
-        if not self.px or not hasattr(self.px, "get_grayscale_data"):
+        if not self.px:
             log.info("Line follow unavailable (no sensors).")
             return False
         self._stop.clear()
         self.running = True
+
+        # Reset dynamic state
+        self._dark_line = None
+        self._prev_err = 0.0
+        self._last_thr = 0.0
+        self._last_steer = 0.0
+        now = time()
+        self._last_seen_at = now
+        self._last_seen_pos = 0.0
+        self._mode = "FOLLOW"
+        self._search_dir = 1
+        self._search_amp = 12.0
+        self._search_hold_until = now + self._SEARCH_STEP_SEC
+        self._last_ts = now
+
         self._task = socketio.start_background_task(self._loop)
         return True
 
@@ -515,25 +547,131 @@ class LineFollower:
         if reason:
             log.info("Line follower stopped: %s", reason)
 
-    def _compute(self, vals):
+    @staticmethod
+    def _clip(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    def _slew(self, current, target, rate_per_sec, dt):
+        max_step = rate_per_sec * dt
+        if target > current + max_step:
+            return current + max_step
+        if target < current - max_step:
+            return current - max_step
+        return target
+
+    def _normalize_signals(self, vals):
+      """
+      Inputs: 0 = white (line), 1 = black (background).
+      Output: line-likelihood in [0..1], where 1 means "on the white line".
+      """
+      try:
+          L, M, R = [float(v) for v in vals[:3]]
+      except Exception:
+          return 0.0, 0.0, 0.0
+      sL = self._clip(L-1.0 , 0.0, 1.0)
+      sM = self._clip(M-1.0, 0.0, 1.0)
+      sR = self._clip(R-1.0, 0.0, 1.0)
+      return sL, sM, sR
+
+    def _estimate_error(self, vals):
+        """
+        Returns (error, confidence)
+        - error in [-1..1]: negative => line on left, positive => right
+        - confidence in [0..1]: higher means our estimate is reliable
+        """
+        sL, sM, sR = self._normalize_signals(vals)
+        w = sL + sM + sR
+        if w < 1e-3:
+            return 0.0, 0.0
+        # Weighted centroid across positions [-1, 0, +1]
+        error = (-1.0 * sL + 0.0 * sM + 1.0 * sR) / max(w, 1e-6)
+        conf = max(sL, sM, sR)
+
+        # Optional digital reinforcement (if available: 0=line, 1=bg)
         try:
             if hasattr(self.px, "get_line_status"):
                 st = safe_call(self.px, "get_line_status", vals, log_label="line_status", default=None)
                 if isinstance(st, (list, tuple)) and len(st) >= 3:
-                    # treat numeric 0/1 or bools
-                    L, M, R = int(bool(st[0])), int(bool(st[1])), int(bool(st[2]))
-                    # interpret 0=line, 1=background (as in the sample script)
-                    if L == 0 and M == 0 and R == 0:
-                        return 0, 0
-                    if M == 1:
-                        return LINEFOLLOW_BASE_SPEED, 0
-                    # if left sensor reads background -> line on right -> steer right
-                    if L == 1:
-                        return LINEFOLLOW_BASE_SPEED, -40
-                    if R == 1:
-                        return LINEFOLLOW_BASE_SPEED, 40
+                    Lb, Mb, Rb = int(bool(st[0])), int(bool(st[1])), int(bool(st[2]))
+                    if (Lb, Mb, Rb).count(0) >= 1:
+                        if Mb == 0:
+                            error = 0.0
+                        elif Lb == 0 and Rb != 0:
+                            error = -1.0
+                        elif Rb == 0 and Lb != 0:
+                            error = 1.0
+                        else:
+                            error = 0.0  # wide line
+                        conf = max(conf, 0.9)
         except Exception as e:
-            log.debug("get_line_status helper failed: %s", e)
+            log.debug("line_status assist failed: %s", e)
+
+        return self._clip(error, -1.0, 1.0), self._clip(conf, 0.0, 1.0)
+
+    def _pd_steer(self, error, dt):
+        d_err = (error - self._prev_err) / max(dt, 1e-6)
+        steer = self._KP * error + self._KD * d_err
+        self._prev_err = error
+        return self._clip(steer, -self._MAX_STEER, self._MAX_STEER)
+
+    def _compute(self, vals, now, dt):
+        """
+        3 modes:
+        - FOLLOW: normal PD control using analog centroid
+        - GAP: keep reduced speed and last-known bias to bridge short gaps
+        - SEARCH: slow zig-zag growing amplitude to re-acquire the line
+        """
+        error, conf = self._estimate_error(vals)
+        saw_line = conf >= self._CONF_THRESHOLD
+        if saw_line:
+            self._last_seen_at = now
+            self._last_seen_pos = error
+
+        time_since_seen = now - self._last_seen_at
+        if saw_line:
+            if self._mode != "FOLLOW":
+                self._mode = "FOLLOW"
+                self._search_amp = 12.0
+                self._search_dir = 1
+                self._search_hold_until = now + self._SEARCH_STEP_SEC
+        else:
+            if time_since_seen <= self._GAP_MAX_SEC:
+                self._mode = "GAP"
+            else:
+                self._mode = "SEARCH"
+
+        # Speeds (relative to your configured base speed)
+        base = int(LINEFOLLOW_BASE_SPEED)
+        gap_speed = int(base * 0.6)
+        lost_speed = max(15, int(base * 0.35))
+
+        if self._mode == "FOLLOW":
+            target_thr = base
+            target_steer = self._pd_steer(error, dt)
+
+        elif self._mode == "GAP":
+            target_thr = gap_speed
+            # Keep last steering, bias toward the last known line side
+            bias = self._clip(self._last_seen_pos, -1.0, 1.0)
+            target_steer = self._clip(self._last_steer + 25.0 * bias, -self._MAX_STEER, self._MAX_STEER)
+
+        else:  # SEARCH
+            target_thr = lost_speed
+            if now >= self._search_hold_until:
+                self._search_hold_until = now + self._SEARCH_STEP_SEC
+                self._search_dir *= -1
+            # Grow amplitude while searching
+            self._search_amp = self._clip(self._search_amp + self._SEARCH_AMP_RATE * dt, 10.0, float(self._MAX_STEER))
+            target_steer = self._search_dir * self._search_amp
+
+        # Smooth outputs
+        thr = self._slew(self._last_thr, target_thr, self._THR_SLEW, dt)
+        steer = self._slew(self._last_steer, target_steer, self._STEER_SLEW, dt)
+
+        self._last_thr = thr
+        self._last_steer = steer
+
+        return int(round(thr)), int(round(steer))
 
     def _loop(self):
         origin = "auto_line"
@@ -542,12 +680,17 @@ class LineFollower:
                 self.stop("playback started")
                 break
             try:
+                now = time()
+                dt = now - self._last_ts
+                dt = self._clip(dt, self._DT_MIN, self._DT_MAX)
+                self._last_ts = now
+
                 vals = safe_call(self.px, "get_grayscale_data", log_label="grayscale", default=None)
                 if not isinstance(vals, (list, tuple)) or len(vals) < 3:
                     socketio.sleep(0.06)
                     continue
 
-                thr, st = self._compute(vals)
+                thr, st = self._compute(vals, now, dt)
 
                 # respect crash avoidance
                 if auto_state.get("crash_avoid_enabled") and obstacle_state.get("blocked_forward"):
@@ -558,11 +701,12 @@ class LineFollower:
                 recorder.record_event("drive", {"throttle": thr, "steer": st})
             except Exception as e:
                 log.debug("Line follower step failed: %s", e)
-            socketio.sleep(0.06)
+            socketio.sleep(0.01)
 
 linef = LineFollower(px)
 
 def set_line_follow_enabled(enabled: bool, reason=None):
+    prev = bool(auto_state.get("line_follow_enabled"))
     auto_state["line_follow_enabled"] = bool(enabled)
     if enabled:
         ok = linef.start()
@@ -570,6 +714,8 @@ def set_line_follow_enabled(enabled: bool, reason=None):
             auto_state["line_follow_enabled"] = False
     else:
         linef.stop(reason or "disabled")
+    if bool(auto_state["line_follow_enabled"]) != prev:
+        emit_auto_state()
 
 def set_crash_avoid_enabled(enabled: bool):
     auto_state["crash_avoid_enabled"] = bool(enabled)
@@ -959,7 +1105,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
 }
 
 /* small hover polish */
-@media(hover:hover) and (pointer:fine){.btn-primary:hover{transform:translateY(-3px)}.thumb:hover{transform:translateY(-6px);box-shadow:0 22px 46px rgba(0,0,0,.6)}}
+@media(hover:hover) and (pointer:fine){.btn-primary:hover{transform:translateY(-3px)}.thumb:hover{transform:scale(1.03);transition:}}
 </style>
 </head>
 <body>
