@@ -27,6 +27,9 @@ Vilib = optional_import("vilib", "Vilib")
 Music = optional_import("robot_hat", "Music")
 ADC = optional_import("robot_hat", "ADC")
 
+# ximgproc is always available per user
+ximgproc = cv2.ximgproc if cv2 and hasattr(cv2, "ximgproc") else None
+
 # ---------- Config ----------
 DIR_MIN, DIR_MAX = -30, 30
 CAM_PAN_MIN, CAM_PAN_MAX = -90, 90
@@ -45,7 +48,7 @@ LINEFOLLOW_BASE_SPEED = 10
 # ---------- Vision config ----------
 # White-line detection + path prediction using camera (OpenCV)
 # Tight-turn tuned
-VISION_DOWNSCALE_WIDTH = 500     # a bit more detail (watch CPU)
+VISION_DOWNSCALE_WIDTH = 320     # a bit more detail (watch CPU)
 VISION_ROI_H_FRAC = 0.80         # bottom 55% of the image
 VISION_MIN_AREA_RATIO = 0.005
 VISION_MAX_STALENESS = 0.5
@@ -54,6 +57,17 @@ VISION_DRAW_THICK = 2
 VISION_POLY_DEG = 3              # use cubic fit for curved lines
 VISION_POLY_SAMPLES = 24
 VISION_MAX_POINTS_FIT = 2000
+
+# Added: Thinning + seam options and gap bridging
+VISION_USE_THINNING = True
+VISION_THIN_MIN_PTS = 60
+VISION_CANNY_LO, VISION_CANNY_HI = 60, 160
+VISION_USE_SEAM = True
+VISION_SEAM_WIN = 28
+VISION_SEAM_STEP = 2
+VISION_SEAM_W_WHITE = 0.55
+VISION_SEAM_W_RIDGE = 0.35
+VISION_SEAM_W_EDGE = 0.10
 
 # Photo folder
 try:
@@ -489,6 +503,96 @@ class ObstacleMonitor:
 
 obmon = ObstacleMonitor(px)
 
+# ---------- Vision helpers (enhanced) ----------
+def _ensure_odd(x):
+    xi = int(max(1, round(x)))
+    return xi if xi % 2 == 1 else xi + 1
+
+def compute_whiteness(roi_bgr):
+    if not cv2 or not np:
+        return None
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+    Vf = V.astype(np.float32) / 255.0
+    Sf = S.astype(np.float32) / 255.0
+    w_hsv = Vf * (1.0 - 0.6 * Sf)
+
+    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0].astype(np.float32) / 255.0
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        Lc = clahe.apply((L * 255).astype(np.uint8)).astype(np.float32) / 255.0
+    except Exception:
+        Lc = L
+
+    w = 0.55 * w_hsv + 0.45 * Lc
+    return np.clip(w, 0.0, 1.0)
+
+def ridge_center_response(gray_u8):
+    if not cv2 or not np:
+        return None
+    g32 = gray_u8.astype(np.float32) / 255.0
+    lap = cv2.Laplacian(g32, cv2.CV_32F, ksize=3)
+    r = -lap
+    mn, mx = float(np.min(r)), float(np.max(r))
+    if mx - mn < 1e-6:
+        return np.zeros_like(r, dtype=np.float32)
+    r = (r - mn) / (mx - mn)
+    r = cv2.GaussianBlur(r, (3, 3), 0)
+    return r
+
+def thin_mask(mask):
+    if not ximgproc or not VISION_USE_THINNING:
+        return None
+    try:
+        m = (mask > 0).astype(np.uint8) * 255
+        skel = ximgproc.thinning(m, thinningType=getattr(ximgproc, "THINNING_ZHANGSUEN", 0))
+        skel = cv2.morphologyEx(skel, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+        return skel
+    except Exception:
+        return None
+
+def build_cost_map(roi_bgr, gray_u8):
+    W = compute_whiteness(roi_bgr)  # [0..1]
+    if W is None:
+        W = (gray_u8.astype(np.float32) / 255.0)
+    R = ridge_center_response(gray_u8)
+    if R is None:
+        R = np.zeros_like(W, dtype=np.float32)
+    try:
+        edges = cv2.Canny(gray_u8, VISION_CANNY_LO, VISION_CANNY_HI)
+        E = (edges > 0).astype(np.float32)
+        E = cv2.GaussianBlur(E, (5, 5), 0)
+    except Exception:
+        E = np.zeros_like(W, dtype=np.float32)
+    score = VISION_SEAM_W_WHITE * W + VISION_SEAM_W_RIDGE * R + VISION_SEAM_W_EDGE * E
+    score = np.clip(score, 0.0, 1.0)
+    cost = 1.0 - score
+    return cost, score
+
+def seam_trace(cost, start_x, step=2, win=28, dx_max=None):
+    h, w = cost.shape[:2]
+    ys, xs = [], []
+    y = h - 1
+    x = int(np.clip(start_x, 0, w - 1))
+    if dx_max is None:
+        dx_max = max(6, int(round(w * 0.02)))
+    while y >= 0:
+        x0 = max(0, x - win)
+        x1 = min(w - 1, x + win)
+        row = cost[y, x0:x1+1]
+        # Penalize large lateral moves
+        offsets = np.arange(x0, x1 + 1) - x
+        penalty = (offsets.astype(np.float32) / max(1.0, dx_max)) ** 2
+        penalty = np.clip(penalty, 0.0, 4.0)
+        scores = row + 0.15 * penalty
+        idx = int(np.argmin(scores))
+        x = x0 + idx
+        xs.append(float(x))
+        ys.append(float(y))
+        y -= step
+    return xs, ys
+
 # ---------- Vision (OpenCV): white-line centroid + path prediction + waypoint ----------
 def vision_detect_white_line(jpg_bytes):
     """
@@ -532,25 +636,33 @@ def vision_detect_white_line(jpg_bytes):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Bright mask + contrast edges near white
-        thr_val, white = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        white = cv2.morphologyEx(white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        # Build whiteness and ridge cues
+        whiten = compute_whiteness(roi)                        # [0..1]
+        gray_u8 = gray
+        ridge = ridge_center_response(gray_u8)                 # [0..1]
 
-        k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, k3)
+        # Base white mask via Otsu on whiteness
+        whit_u8 = (np.clip(whiten * 255.0, 0, 255).astype(np.uint8))
+        thr_val, white = cv2.threshold(whit_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Edges near white to reinforce (helps with black borders)
         try:
-            gthr = max(20, int(np.percentile(grad, 88)))
+            edges = cv2.Canny(gray_u8, VISION_CANNY_LO, VISION_CANNY_HI)
         except Exception:
-            gthr = 40
-        strong_edges = cv2.inRange(grad, gthr, 255)
-        white_dil = cv2.dilate(white, k3, iterations=1)
-        drop_mask = cv2.bitwise_and(strong_edges, white_dil)
-        drop_band = cv2.dilate(drop_mask, k3, iterations=1)
+            edges = np.zeros_like(gray_u8, dtype=np.uint8)
+        edges_d = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+        white_d = cv2.dilate(white, np.ones((3,3), np.uint8), iterations=1)
+        band = cv2.bitwise_and(edges_d, white_d)
 
-        mask = cv2.bitwise_or(white, drop_band)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        # Merge and bridge small gaps (vertical-biased close scaled to ROI)
+        mask = cv2.bitwise_or(white, band)
+        kx = _ensure_odd(max(3, int(round(w * 0.01))))
+        ky = _ensure_odd(max(7, int(round(roi_h * 0.06))))
+        kclose = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kclose, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
 
+        # Contour/centroid for fallback error and mask-derived confidence
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         centroid = None
@@ -576,21 +688,51 @@ def vision_detect_white_line(jpg_bytes):
                     cy = float(M["m01"] / M["m00"])
                     centroid = (cx, cy)
                     contour = c
-                    # fallback centroid error (overridden by poly if available)
+                    # centroid-based error as fallback
                     err_centroid = (cx / max(1.0, w - 1)) * 2.0 - 1.0
                     err = float(max(-1.0, min(1.0, err_centroid)))
                     conf = _cam_confidence_from_mask(mask, area_ratio)
 
+        # Choose points for polynomial fit
+        src_kind = None
+        used_pts = None
+
+        # Try skeleton first
+        skel = thin_mask(mask)
+        if skel is not None:
+            nz_skel = np.column_stack(np.nonzero(skel))
+            if nz_skel.shape[0] >= VISION_THIN_MIN_PTS:
+                used_pts = nz_skel
+                src_kind = "skel"
+
+        # If skeleton too sparse (breaks), use seam fallback
+        if used_pts is None and VISION_USE_SEAM:
+            cost, score = build_cost_map(roi, gray_u8)
+            band_h = max(6, int(0.10 * cost.shape[0]))
+            bottom_band = np.mean(score[cost.shape[0]-band_h:,:], axis=0)
+            start_x = int(np.argmax(bottom_band))
+            xs, ys = seam_trace(cost, start_x, step=VISION_SEAM_STEP, win=VISION_SEAM_WIN)
+            if len(xs) >= 8:
+                used_pts = np.column_stack([np.array(ys, dtype=np.float32),
+                                            np.array(xs, dtype=np.float32)]).astype(np.float32)
+                src_kind = "seam"
+
+        # Otherwise fall back to dense mask points
+        if used_pts is None:
+            nz_mask = np.column_stack(np.nonzero(mask))
+            if nz_mask.shape[0] > 0:
+                used_pts = nz_mask
+                src_kind = "mask"
+
         # Polynomial fit for bottom error, heading and waypoint
-        nz = np.column_stack(np.nonzero(mask))
-        if nz.shape[0] > 0:
-            if nz.shape[0] > VISION_MAX_POINTS_FIT:
-                sel = np.random.choice(nz.shape[0], VISION_MAX_POINTS_FIT, replace=False)
-                nz = nz[sel]
-            ys = nz[:, 0].astype(np.float32)
-            xs = nz[:, 1].astype(np.float32)
+        if used_pts is not None and used_pts.shape[0] > 0:
+            pts = used_pts
+            if pts.shape[0] > VISION_MAX_POINTS_FIT:
+                sel = np.random.choice(pts.shape[0], VISION_MAX_POINTS_FIT, replace=False)
+                pts = pts[sel]
+            ys = pts[:, 0].astype(np.float32)
+            xs = pts[:, 1].astype(np.float32)
             try:
-                # Force cubic for better tight turns
                 coefs = np.polyfit(ys, xs, 3)
                 yb = float((y1 - y0) - 1)
 
@@ -604,7 +746,7 @@ def vision_detect_white_line(jpg_bytes):
                 err_poly = (x_fit_bottom / max(1.0, w - 1)) * 2.0 - 1.0
                 err = float(max(-1.0, min(1.0, err_poly)))
 
-                # Pure-pursuit virtual waypoint (lookahead up the ROI)
+                # Pure‑pursuit virtual waypoint (lookahead up the ROI)
                 LOOKAHEAD_PX = float(os.environ.get("PP_LOOKAHEAD_PX", "42"))
                 y_wp = max(0.0, yb - LOOKAHEAD_PX)
                 x_wp = float(np.polyval(coefs, y_wp))
@@ -618,7 +760,8 @@ def vision_detect_white_line(jpg_bytes):
                 curve_pts = [(float(xx), float(yy)) for yy, xx in zip(ys_lin, xs_fit)]
                 poly_info = {"coefs": tuple([float(v) for v in coefs]),
                              "slope_bottom": float(m),
-                             "curve": curve_pts}
+                             "curve": curve_pts,
+                             "src": src_kind}
             except Exception:
                 pass
 
@@ -693,7 +836,12 @@ def camera_overlay_on_jpg(jpg_bytes):
             cv2.circle(img, (ox, oy), 6, (200, 120, 20), -1)
             cv2.circle(img, (ox, oy), 10, (60, 140, 255), 2)
 
+        src = poly.get("src") if poly else None
         label = f"err={err:+.2f} conf={conf:.2f} hd={heading:+.2f}"
+        if src == "skel":
+            label += " +thin"
+        elif src == "seam":
+            label += " +seam"
         cv2.putText(img, label, (10, max(20, oy0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
 
         ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
