@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import io
 import os
 import math
 import signal
@@ -7,7 +8,7 @@ import logging
 from time import time, sleep, strftime, localtime
 from threading import Thread, Event, Lock
 
-from flask import Flask, render_template_string, Response, send_from_directory, url_for, jsonify, stream_with_context, request, redirect
+from flask import Flask, render_template_string, Response, send_from_directory, url_for, jsonify, request, redirect
 from flask_socketio import SocketIO, emit
 
 # ---------- Optional imports ----------
@@ -18,14 +19,16 @@ def optional_import(module, attr=None):
     except Exception:
         return None
 
-requests = optional_import("requests")
 cv2 = optional_import("cv2")
 np = optional_import("numpy")
 reset_mcu = optional_import("robot_hat.utils", "reset_mcu")
 Picarx = optional_import("picarx", "Picarx")
-Vilib = optional_import("vilib", "Vilib")
 Music = optional_import("robot_hat", "Music")
 ADC = optional_import("robot_hat", "ADC")
+Picamera2 = optional_import("picamera2", "Picamera2")
+Transform = optional_import("libcamera", "Transform")
+MJPEGEncoder = optional_import("picamera2.encoders", "MJPEGEncoder")
+FileOutput    = optional_import("picamera2.outputs", "FileOutput")
 
 # ximgproc is always available per user
 ximgproc = cv2.ximgproc if cv2 and hasattr(cv2, "ximgproc") else None
@@ -39,26 +42,23 @@ BATTERY_ADC_PIN = "A4"
 VBAT_MIN, VBAT_MAX = 5.8, 8.0
 BATTERY_POLL_SEC = 15
 
-OBSTACLE_THRESHOLD_CM = 15.0     # block forward below this
-OBSTACLE_CLEAR_CM = 17.0         # clear block above this (hysteresis)
+OBSTACLE_THRESHOLD_CM = 15.0
+OBSTACLE_CLEAR_CM = 17.0
 OBSTACLE_POLL_SEC = 0.12
 
 LINEFOLLOW_BASE_SPEED = 10
 
 # ---------- Vision config ----------
-# White-line detection + path prediction using camera (OpenCV)
-# Tight-turn tuned
-VISION_DOWNSCALE_WIDTH = 320     # a bit more detail (watch CPU)
-VISION_ROI_H_FRAC = 0.80         # bottom 55% of the image
+VISION_DOWNSCALE_WIDTH = 320
+VISION_ROI_H_FRAC = 0.80
 VISION_MIN_AREA_RATIO = 0.005
 VISION_MAX_STALENESS = 0.5
 VISION_MIN_DT = 0.07
 VISION_DRAW_THICK = 2
-VISION_POLY_DEG = 3              # use cubic fit for curved lines
+VISION_POLY_DEG = 3
 VISION_POLY_SAMPLES = 24
 VISION_MAX_POINTS_FIT = 2000
 
-# Added: Thinning + seam options and gap bridging
 VISION_USE_THINNING = True
 VISION_THIN_MIN_PTS = 60
 VISION_CANNY_LO, VISION_CANNY_HI = 60, 160
@@ -68,6 +68,31 @@ VISION_SEAM_STEP = 2
 VISION_SEAM_W_WHITE = 0.55
 VISION_SEAM_W_RIDGE = 0.35
 VISION_SEAM_W_EDGE = 0.10
+
+VISION_USE_TOPHAT = True
+VISION_TOPHAT_K = 11
+VISION_TOPHAT_ALPHA = 0.6
+
+VISION_ASPECT_MIN = 1.3
+VISION_MAX_TILT_DEG = 35.0
+
+VISION_POLY_RMSE_MAX = 10.0
+VISION_MIN_VERTICAL_COVER_FRAC = 0.35
+
+STREAM_OVERLAY_MAX_HZ = 6.0
+STREAM_OVERLAY_STALENESS = 0.30
+
+# Picamera2 config
+PICAM_W = int(os.environ.get("PICAM_W", "640"))
+PICAM_H = int(os.environ.get("PICAM_H", "480"))
+PICAM_FPS = int(os.environ.get("PICAM_FPS", "60"))
+PICAM_HFLIP = int(os.environ.get("PICAM_HFLIP", "0"))
+PICAM_VFLIP = int(os.environ.get("PICAM_VFLIP", "0"))
+PICAM_ROT = int(os.environ.get("PICAM_ROT", "0"))
+
+# Ports
+HTTPS_PORT = int(os.environ.get("HTTPS_PORT", "443"))
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "80"))
 
 # Photo folder
 try:
@@ -80,7 +105,6 @@ os.makedirs(PHOTO_FOLDER, exist_ok=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDING_FILE = os.path.join(BASE_DIR, "recording.json")
-VILIB_MJPG_URL = os.environ.get("VILIB_MJPG_URL", "http://127.0.0.1:9000/mjpg")
 TLS_CERT = os.environ.get("TLS_CERT", os.path.join(BASE_DIR, "server.crt"))
 TLS_KEY  = os.environ.get("TLS_KEY",  os.path.join(BASE_DIR, "server.key"))
 
@@ -100,6 +124,10 @@ _last_broadcast_input = {"throttle": None, "steer": None, "pan": None, "tilt": N
 last_controller_sid = None
 redirect_server = None
 
+# Shared overlay cache to avoid re-running detection for stream overlay
+vision_overlay_cache = {"ts": 0.0, "dbg": None, "err": 0.0, "conf": 0.0, "heading": 0.0}
+vision_cache_lock = Lock()
+
 def clamp(x, a, b):
     try:
         return max(a, min(b, int(x)))
@@ -107,23 +135,13 @@ def clamp(x, a, b):
         return a
 
 # ---------- Helpers ----------
-def safe_call(obj, method, *args, log_label=None, default=None):
-    if not obj:
-        return default
-    try:
-        return getattr(obj, method)(*args)
-    except Exception as e:
-        if log_label:
-            log.warning("%s failed: %s", log_label, e)
-        return default
-
 def safe_set(label, fn, value):
-    log.info("Setting %s: %s", label, value)
-    if fn:
-        try:
-            fn(int(value))
-        except Exception as e:
-            log.warning("%s failed: %s", label, e)
+    if fn is None:
+        return
+    try:
+        fn(int(value))
+    except Exception as e:
+        log.warning("%s failed: %s", label, e)
 
 def broadcast_input(payload, force=False):
     global _last_broadcast_input
@@ -270,7 +288,6 @@ class MotorController:
         Thread(target=self._loop, daemon=True).start()
 
     def _hw(self, l, r):
-        log.info("Setting motors: L=%s R=%s", l, r)
         if not self.px:
             return
         try:
@@ -338,19 +355,6 @@ if not px:
 music = Music() if Music else None
 if not music:
     log.info("Music not available in this environment.")
-
-if Vilib:
-    try:
-        Vilib.camera_start(vflip=False, hflip=False)
-        if hasattr(Vilib, "display"):
-            try:
-                Vilib.display(local=False, web=True)
-            except Exception as e:
-                log.info("Vilib.display() non-fatal: %s", e)
-    except Exception as e:
-        log.warning("Vilib.camera_start() failed: %s", e)
-else:
-    log.info("Vilib not available in this environment.")
 
 adc_batt = ADC(BATTERY_ADC_PIN) if ADC else None
 if not adc_batt:
@@ -425,26 +429,28 @@ def prune_photos(max_photos=MAX_PHOTOS):
 def take_photo():
     name = f"photo_{strftime('%Y-%m-%d-%H-%M-%S', localtime(time()))}.jpg"
     path = os.path.join(PHOTO_FOLDER, name)
+    try:
+        # Prefer the latest JPEG already encoded for streaming
+        jpg, ts = frame_hub.latest()
+        if jpg:
+            with open(path, "wb") as f:
+                f.write(jpg)
+            prune_photos()
+            return path
 
-    if Vilib and hasattr(Vilib, "take_photo"):
-        try:
-            Vilib.take_photo(name[:-4], PHOTO_FOLDER + "/")
-
-            for _ in range(10):
-                if os.path.exists(path):
+        # Fallback: capture from Picamera2 directly
+        if hasattr(frame_hub, "picam2") and frame_hub.picam2 and cv2 and np:
+            rgb = frame_hub.picam2.capture_array("main")
+            if rgb is not None and rgb.size > 0:
+                ok, enc = cv2.imencode(".jpg", rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if ok:
+                    with open(path, "wb") as f:
+                        f.write(enc.tobytes())
+                    prune_photos()
                     return path
-                sleep(0.05)
-
-            prefix = os.path.splitext(name)[0]
-            candidates = [os.path.join(PHOTO_FOLDER, f) for f in os.listdir(PHOTO_FOLDER) if f.startswith(prefix)]
-            if candidates:
-                candidates.sort(key=os.path.getmtime, reverse=True)
-                return candidates[0]
-
-            log.info("Vilib saved no detectable file for %s", name)
-            return None
-        except Exception as e:
-            log.info("Vilib.take_photo failed (falling back): %s", e)
+    except Exception as e:
+        log.warning("take_photo failed: %s", e)
+    return None
 
 # ---------- Automation: Obstacle monitor ----------
 class ObstacleMonitor:
@@ -503,7 +509,7 @@ class ObstacleMonitor:
 
 obmon = ObstacleMonitor(px)
 
-# ---------- Vision helpers (enhanced) ----------
+# ---------- Vision helpers ----------
 def _ensure_odd(x):
     xi = int(max(1, round(x)))
     return xi if xi % 2 == 1 else xi + 1
@@ -581,7 +587,6 @@ def seam_trace(cost, start_x, step=2, win=28, dx_max=None):
         x0 = max(0, x - win)
         x1 = min(w - 1, x + win)
         row = cost[y, x0:x1+1]
-        # Penalize large lateral moves
         offsets = np.arange(x0, x1 + 1) - x
         penalty = (offsets.astype(np.float32) / max(1.0, dx_max)) ** 2
         penalty = np.clip(penalty, 0.0, 4.0)
@@ -593,16 +598,28 @@ def seam_trace(cost, start_x, step=2, win=28, dx_max=None):
         y -= step
     return xs, ys
 
-# ---------- Vision (OpenCV): white-line centroid + path prediction + waypoint ----------
+def contour_aspect_and_tilt(contour):
+    if contour is None or len(contour) < 5:
+        return None, None
+    rect = cv2.minAreaRect(contour)
+    (w, h) = rect[1]
+    if w < 1 or h < 1:
+        return None, None
+    aspect = max(h, w) / max(1.0, min(h, w))
+    ang = float(rect[2])
+    if w < h:
+        tilt_from_vertical = abs(ang)
+    else:
+        tilt_from_vertical = abs(ang + 90.0)
+    tilt_from_vertical = min(tilt_from_vertical, 180.0 - tilt_from_vertical)
+    return float(aspect), float(tilt_from_vertical)
+
+def poly_rmse(ys, xs, coefs):
+    xfit = np.polyval(coefs, ys)
+    return float(np.sqrt(np.mean((xfit - xs) ** 2)))
+
+# ---------- Vision detection ----------
 def vision_detect_white_line(jpg_bytes):
-    """
-    Detects a white line and returns:
-      (error, confidence, heading, debug)
-    - error in [-1..1] (from polynomial x(y) at bottom of ROI; centroid fallback)
-    - confidence in [0..1]
-    - heading in [-1..1] (atan(slope_bottom)/(pi/4))
-    debug contains: centroid, contour, poly info, and wp (waypoint)
-    """
     if not cv2 or not np or not jpg_bytes:
         return 0.0, 0.0, 0.0, None
     try:
@@ -615,7 +632,6 @@ def vision_detect_white_line(jpg_bytes):
         if ow <= 0 or oh <= 0:
             return 0.0, 0.0, 0.0, None
 
-        # Downscale for speed/detail balance
         scale = float(VISION_DOWNSCALE_WIDTH) / float(ow)
         if scale < 0.99:
             proc = cv2.resize(orig, (VISION_DOWNSCALE_WIDTH, int(round(oh * scale))), interpolation=cv2.INTER_AREA)
@@ -625,7 +641,6 @@ def vision_detect_white_line(jpg_bytes):
 
         h, w = proc.shape[:2]
 
-        # Bottom-anchored ROI
         roi_h = int(round(h * VISION_ROI_H_FRAC))
         y1 = h
         y0 = max(0, y1 - roi_h)
@@ -636,16 +651,20 @@ def vision_detect_white_line(jpg_bytes):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Build whiteness and ridge cues
-        whiten = compute_whiteness(roi)                        # [0..1]
+        whiten = compute_whiteness(roi)
         gray_u8 = gray
-        ridge = ridge_center_response(gray_u8)                 # [0..1]
+        ridge = ridge_center_response(gray_u8)
 
-        # Base white mask via Otsu on whiteness
         whit_u8 = (np.clip(whiten * 255.0, 0, 255).astype(np.uint8))
-        thr_val, white = cv2.threshold(whit_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if VISION_USE_TOPHAT:
+            k = max(3, int(VISION_TOPHAT_K) | 1)
+            se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            th = cv2.morphologyEx(whit_u8, cv2.MORPH_TOPHAT, se)
+            whit_mix = cv2.addWeighted(th, float(VISION_TOPHAT_ALPHA), whit_u8, float(1.0 - VISION_TOPHAT_ALPHA), 0.0)
+            _, white = cv2.threshold(whit_mix, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, white = cv2.threshold(whit_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Edges near white to reinforce (helps with black borders)
         try:
             edges = cv2.Canny(gray_u8, VISION_CANNY_LO, VISION_CANNY_HI)
         except Exception:
@@ -654,7 +673,6 @@ def vision_detect_white_line(jpg_bytes):
         white_d = cv2.dilate(white, np.ones((3,3), np.uint8), iterations=1)
         band = cv2.bitwise_and(edges_d, white_d)
 
-        # Merge and bridge small gaps (vertical-biased close scaled to ROI)
         mask = cv2.bitwise_or(white, band)
         kx = _ensure_odd(max(3, int(round(w * 0.01))))
         ky = _ensure_odd(max(7, int(round(roi_h * 0.06))))
@@ -662,7 +680,6 @@ def vision_detect_white_line(jpg_bytes):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kclose, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
 
-        # Contour/centroid for fallback error and mask-derived confidence
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         centroid = None
@@ -688,16 +705,27 @@ def vision_detect_white_line(jpg_bytes):
                     cy = float(M["m01"] / M["m00"])
                     centroid = (cx, cy)
                     contour = c
-                    # centroid-based error as fallback
                     err_centroid = (cx / max(1.0, w - 1)) * 2.0 - 1.0
                     err = float(max(-1.0, min(1.0, err_centroid)))
                     conf = _cam_confidence_from_mask(mask, area_ratio)
 
-        # Choose points for polynomial fit
+                    try:
+                        asp, tilt_v = contour_aspect_and_tilt(contour)
+                        penalty = 0.0
+                        if asp is not None and asp < float(VISION_ASPECT_MIN):
+                            penalty += 0.35
+                        if tilt_v is not None and tilt_v > float(VISION_MAX_TILT_DEG):
+                            penalty += 0.25
+                        if penalty > 0.0:
+                            conf = max(0.0, conf * (1.0 - penalty))
+                            if penalty >= 0.60:
+                                contour = None
+                    except Exception:
+                        pass
+
         src_kind = None
         used_pts = None
 
-        # Try skeleton first
         skel = thin_mask(mask)
         if skel is not None:
             nz_skel = np.column_stack(np.nonzero(skel))
@@ -705,7 +733,6 @@ def vision_detect_white_line(jpg_bytes):
                 used_pts = nz_skel
                 src_kind = "skel"
 
-        # If skeleton too sparse (breaks), use seam fallback
         if used_pts is None and VISION_USE_SEAM:
             cost, score = build_cost_map(roi, gray_u8)
             band_h = max(6, int(0.10 * cost.shape[0]))
@@ -717,14 +744,12 @@ def vision_detect_white_line(jpg_bytes):
                                             np.array(xs, dtype=np.float32)]).astype(np.float32)
                 src_kind = "seam"
 
-        # Otherwise fall back to dense mask points
         if used_pts is None:
             nz_mask = np.column_stack(np.nonzero(mask))
             if nz_mask.shape[0] > 0:
                 used_pts = nz_mask
                 src_kind = "mask"
 
-        # Polynomial fit for bottom error, heading and waypoint
         if used_pts is not None and used_pts.shape[0] > 0:
             pts = used_pts
             if pts.shape[0] > VISION_MAX_POINTS_FIT:
@@ -736,24 +761,20 @@ def vision_detect_white_line(jpg_bytes):
                 coefs = np.polyfit(ys, xs, 3)
                 yb = float((y1 - y0) - 1)
 
-                # slope at bottom for heading
                 m = 3.0 * coefs[0] * (yb ** 2) + 2.0 * coefs[1] * yb + coefs[2]
                 heading_norm = math.atan(float(m)) / (math.pi / 4.0)
                 heading_norm = float(max(-1.0, min(1.0, heading_norm)))
 
-                # error from fit at bottom (override centroid)
                 x_fit_bottom = float(np.polyval(coefs, yb))
                 err_poly = (x_fit_bottom / max(1.0, w - 1)) * 2.0 - 1.0
                 err = float(max(-1.0, min(1.0, err_poly)))
 
-                # Pure‑pursuit virtual waypoint (lookahead up the ROI)
                 LOOKAHEAD_PX = float(os.environ.get("PP_LOOKAHEAD_PX", "42"))
                 y_wp = max(0.0, yb - LOOKAHEAD_PX)
                 x_wp = float(np.polyval(coefs, y_wp))
                 err_wp = float(max(-1.0, min(1.0, (x_wp / max(1.0, w - 1)) * 2.0 - 1.0)))
                 wp_info = {"x": x_wp, "y": y_wp + y0, "err": err_wp}
 
-                # Samples for overlay curve
                 samp = max(12, int(VISION_POLY_SAMPLES))
                 ys_lin = np.linspace(0.0, (y1 - y0) - 1.0, samp)
                 xs_fit = np.polyval(coefs, ys_lin)
@@ -762,6 +783,14 @@ def vision_detect_white_line(jpg_bytes):
                              "slope_bottom": float(m),
                              "curve": curve_pts,
                              "src": src_kind}
+
+                try:
+                    rmse = poly_rmse(ys, xs, coefs)
+                    cover_frac = (max(ys) - min(ys)) / max(1.0, (y1 - y0))
+                    if rmse > float(VISION_POLY_RMSE_MAX) or cover_frac < float(VISION_MIN_VERTICAL_COVER_FRAC):
+                        conf = max(0.0, conf * 0.25)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -770,21 +799,26 @@ def vision_detect_white_line(jpg_bytes):
             "centroid": centroid, "contour": contour,
             "poly": poly_info, "wp": wp_info
         }
+
+        try:
+            with vision_cache_lock:
+                vision_overlay_cache["ts"] = time()
+                vision_overlay_cache["dbg"] = debug
+                vision_overlay_cache["err"] = float(err)
+                vision_overlay_cache["conf"] = float(conf)
+                vision_overlay_cache["heading"] = float(heading_norm)
+        except Exception:
+            pass
+
         return float(err), float(conf), float(heading_norm), debug
     except Exception:
         return 0.0, 0.0, 0.0, None
 
 def camera_overlay_on_jpg(jpg_bytes):
-    """
-    Returns annotated JPG bytes showing ROI, contour, centroid, predicted path curve, and waypoint.
-    If detection unavailable, returns original jpg_bytes.
-    """
     if not cv2 or not np or not jpg_bytes:
         return jpg_bytes
     try:
-        # Run detection to get debug info
         err, conf, heading, dbg = vision_detect_white_line(jpg_bytes)
-        # Decode original for drawing
         arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None or img.size == 0:
@@ -829,7 +863,6 @@ def camera_overlay_on_jpg(jpg_bytes):
             pts = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(img, [pts], isClosed=False, color=(255, 180, 60), thickness=2, lineType=cv2.LINE_AA)
 
-        # waypoint marker (blue)
         if wp and "x" in wp and "y" in wp:
             ox = int(round(float(wp["x"]) / max(1e-6, scale)))
             oy = int(round(float(wp["y"]) / max(1e-6, scale)))
@@ -851,26 +884,82 @@ def camera_overlay_on_jpg(jpg_bytes):
     except Exception:
         return jpg_bytes
 
-def _estimate_camera_line():
-    """
-    Uses latest frame to compute (err, conf, heading). Returns zeros if stale or unavailable.
-    """
+def camera_overlay_from_cache(jpg_bytes):
+    if not cv2 or not np or not jpg_bytes:
+        return jpg_bytes
     try:
-        jpg, ts = frame_hub.latest()
-        if not jpg:
-            return 0.0, 0.0, 0.0
-        if time() - ts > VISION_MAX_STALENESS:
-            return 0.0, 0.0, 0.0
-        err, conf, heading, _ = vision_detect_white_line(jpg)
-        return err, conf, heading
-    except Exception:
-        return 0.0, 0.0, 0.0
+        with vision_cache_lock:
+            cache = dict(vision_overlay_cache)
+        dbg = cache.get("dbg")
+        if not dbg:
+            return jpg_bytes
+        err = cache.get("err", 0.0)
+        conf = cache.get("conf", 0.0)
+        heading = cache.get("heading", 0.0)
 
-# Extended camera metrics (with curvature and waypoint error)
+        arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            return jpg_bytes
+
+        oh, ow = img.shape[:2]
+        scale = float(dbg.get("scale", 1.0))
+        y0 = int(dbg.get("y0", 0))
+        y1 = int(dbg.get("y1", int(round(oh * scale * VISION_ROI_H_FRAC))))
+        centroid = dbg.get("centroid", None)
+        contour = dbg.get("contour", None)
+        poly = dbg.get("poly", None)
+        wp = dbg.get("wp", None)
+
+        oy0 = int(round(y0 / max(1e-6, scale)))
+        oy1 = int(round(y1 / max(1e-6, scale)))
+        cv2.rectangle(img, (0, oy0), (ow - 1, oy1), (40, 220, 255), VISION_DRAW_THICK)
+
+        if contour is not None and centroid is not None:
+            c = contour
+            cx, cy = centroid
+            c_abs = c.copy()
+            c_abs[:, 0, 1] = c_abs[:, 0, 1] + y0
+            if scale != 0:
+                c_orig = np.array(c_abs[:, 0, :] / scale, dtype=np.int32).reshape(-1, 1, 2)
+            else:
+                c_orig = c_abs
+            cv2.drawContours(img, [c_orig], -1, (0, 255, 0), VISION_DRAW_THICK)
+            ocx = int(round(cx / max(1e-6, scale)))
+            ocy = int(round((cy + y0) / max(1e-6, scale)))
+            cv2.circle(img, (ocx, ocy), 6, (0, 0, 255), -1)
+
+        if poly and isinstance(poly.get("curve"), list) and len(poly["curve"]) >= 2:
+            pts = []
+            for (xx, yy) in poly["curve"]:
+                ox = int(round(xx / max(1e-6, scale)))
+                oy = int(round((yy + y0) / max(1e-6, scale)))
+                pts.append([ox, oy])
+            pts = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], isClosed=False, color=(255, 180, 60), thickness=2, lineType=cv2.LINE_AA)
+
+        if wp and "x" in wp and "y" in wp:
+            ox = int(round(float(wp["x"]) / max(1e-6, scale)))
+            oy = int(round(float(wp["y"]) / max(1e-6, scale)))
+            cv2.circle(img, (ox, oy), 6, (200, 120, 20), -1)
+            cv2.circle(img, (ox, oy), 10, (60, 140, 255), 2)
+
+        src = poly.get("src") if poly else None
+        label = f"err={err:+.2f} conf={conf:.2f} hd={heading:+.2f}"
+        if src == "skel":
+            label += " +thin"
+        elif src == "seam":
+            label += " +seam"
+        cv2.putText(img, label, (10, max(20, oy0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
+
+        ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if ok:
+            return enc.tobytes()
+        return jpg_bytes
+    except Exception:
+        return jpg_bytes
+
 def camera_line_metrics():
-    """
-    Returns: err[-1..1], conf[0..1], heading[-1..1], curv[0..1]
-    """
     try:
         jpg, ts = frame_hub.latest()
         if not jpg or (time() - ts) > VISION_MAX_STALENESS:
@@ -906,16 +995,12 @@ def camera_line_metrics():
         return 0.0, 0.0, 0.0, 0.0
 
 def camera_line_metrics_v2():
-    """
-    Returns: err, conf, heading, curv, wp_err
-    """
     try:
         jpg, ts = frame_hub.latest()
         if not jpg or (time() - ts) > VISION_MAX_STALENESS:
             return 0.0, 0.0, 0.0, 0.0, 0.0
         err, conf, heading, dbg = vision_detect_white_line(jpg)
 
-        # curvature from slope change near bottom
         curv = 0.0
         try:
             poly = dbg.get("poly") if dbg else None
@@ -951,7 +1036,6 @@ def camera_line_metrics_v2():
     except Exception:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
-# ---------- Grayscale front-end (unchanged) ----------
 class GrayFrontEnd:
     def __init__(self, picarx,
                  ema_alpha=0.35,
@@ -1027,7 +1111,7 @@ class GrayFrontEnd:
     def _update_polarity(self, R):
         L, M, Rr = R
         neigh = 0.5 * (L + Rr)
-        score = float(M - neigh)  # positive => white line
+        score = float(M - neigh)
         if self.polarity is None:
             if abs(score) > self.pol_hys:
                 self.polarity = 'white' if score > 0 else 'dark'
@@ -1097,9 +1181,6 @@ class GrayFrontEnd:
         return float(x), float(conf), self.polarity
 
 def _cam_confidence_from_mask(mask, area_ratio):
-    """
-    Build a camera confidence in [0..1] from area ratio and near-bottom density.
-    """
     import numpy as _np
     h, w = mask.shape[:2]
 
@@ -1115,30 +1196,28 @@ def _cam_confidence_from_mask(mask, area_ratio):
     conf = 0.65 * ar + 0.35 * min(1.0, 3.0 * dens)
     return float(max(0.0, min(1.0, conf)))
 
-# ---------- Automation: Line follower (hybrid IR + camera + pure‑pursuit) ----------
+# ---------- Automation: Line follower ----------
 class LineFollower:
-    # Tunables (tight turn tuned)
-    _MAX_STEER = 100            # steer command limit
+    _MAX_STEER = 100
     _GAP_MAX_SEC = 1
     _CONF_THRESHOLD = 0.22
     _SEARCH_STEP_SEC = 0.5
     _SEARCH_AMP_RATE = 120.0
-    _STEER_SLEW = 800.0         # faster steering slew
+    _STEER_SLEW = 800.0
     _THR_SLEW = 300.0
-    _KP = 60.0                  # PD gains adjusted
+    _KP = 60.0
     _KD = 35.0
-    _KH = 55.0                  # stronger heading feed-forward
+    _KH = 55.0
     _DT_MIN = 0.02
     _DT_MAX = 0.2
 
-    _K_CURV_SLOW = 0.45         # slow down more on tight curvature
+    _K_CURV_SLOW = 0.45
     _CAM_LOOKAHEAD = 0.10
     _CAM_SEARCH_CONF = 0.18
 
-    # Pure‑pursuit waypoint blend
-    _PP_LOOKAHEAD_PX = 42.0     # informational; actual vision uses env PP_LOOKAHEAD_PX
-    _K_PP = 60.0                # steer units per normalized waypoint error
-    _PP_BLEND = 0.6             # 0..1 weighting of PP steer when cam_conf=1
+    _PP_LOOKAHEAD_PX = 42.0
+    _K_PP = 60.0
+    _PP_BLEND = 0.6
 
     def __init__(self, picarx):
         self.px = picarx
@@ -1146,7 +1225,6 @@ class LineFollower:
         self._task = None
         self.running = False
 
-        # Advanced state
         self._dark_line = None
         self._prev_err = 0.0
         self._last_thr = 0.0
@@ -1158,9 +1236,9 @@ class LineFollower:
         self._search_amp = 12.0
         self._search_hold_until = 0.0
         self._last_ts = time()
-        # camera estimator cache
+
         self._vision_cache = {"ts": 0.0, "err": 0.0, "conf": 0.0, "heading": 0.0, "curv": 0.0, "wp_err": 0.0}
-        # grayscale front-end
+
         self.gfe = GrayFrontEnd(picarx)
 
     def is_running(self):
@@ -1175,7 +1253,6 @@ class LineFollower:
         self._stop.clear()
         self.running = True
 
-        # Reset dynamic state
         self._dark_line = None
         self._prev_err = 0.0
         self._last_thr = 0.0
@@ -1221,10 +1298,6 @@ class LineFollower:
         return err, conf
 
     def _estimate_error_cam(self, now):
-        """
-        Returns (error_pred, confidence, heading, curvature, waypoint_error)
-        Throttled via VISION_MIN_DT and cached.
-        """
         if not cv2 or not np:
             return 0.0, 0.0, 0.0, 0.0, 0.0
         if now - self._vision_cache["ts"] < VISION_MIN_DT:
@@ -1232,7 +1305,6 @@ class LineFollower:
             return vc["err"], vc["conf"], vc["heading"], vc.get("curv", 0.0), vc.get("wp_err", 0.0)
         err, conf, heading, curv, wp_err = camera_line_metrics_v2()
 
-        # Small prediction to offset camera latency using heading
         err_pred = max(-1.0, min(1.0, err + 0.35 * heading * self._CAM_LOOKAHEAD / 0.1))
 
         self._vision_cache.update({"ts": now,
@@ -1244,31 +1316,15 @@ class LineFollower:
         return err_pred, conf, heading, curv, wp_err
 
     def _estimate_error_hybrid(self, vals, now):
-        """
-        Fusion of IR and camera estimates.
-        Returns (error, confidence, heading, curvature, waypoint_error, cam_conf_for_weighting)
-        """
-        ir_err, ir_conf = self._estimate_error_ir(vals)
-        cam_err, cam_conf, cam_heading, cam_curv, cam_wp_err = self._estimate_error_cam(now)
-
-        if ir_conf <= 0.0 and cam_conf <= 0.0:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        if ir_conf <= 0.0:
-            return cam_err, cam_conf, cam_heading, cam_curv, cam_wp_err, cam_conf
-        if cam_conf <= 0.0:
-            return ir_err, ir_conf, 0.0, 0.0, 0.0, 0.0
-
-        # down-weight IR as curvature rises
-        w_ir, w_cam = ir_conf, cam_conf
-        if cam_curv > 0.4: w_ir *= 0.6
-        if cam_curv > 0.7: w_ir *= 0.3
-
-        err = (w_ir * ir_err + w_cam * cam_err) / max(1e-6, (w_ir + w_cam))
-        conf = 1.0 - (1.0 - ir_conf) * (1.0 - cam_conf)
-        heading = cam_heading * cam_conf
-        curv = cam_curv * cam_conf
-
-        return self._clip(err, -1.0, 1.0), self._clip(conf, 0.0, 1.0), self._clip(heading, -1.0, 1.0), self._clip(curv, 0.0, 1.0), self._clip(cam_wp_err, -1.0, 1.0), float(cam_conf)
+        err, conf, heading, curv, wp_err = self._estimate_error_cam(now)
+        return (
+            self._clip(err, -1.0, 1.0),
+            self._clip(conf, 0.0, 1.0),
+            self._clip(heading, -1.0, 1.0),
+            self._clip(curv, 0.0, 1.0),
+            self._clip(wp_err, -1.0, 1.0),
+            float(conf)
+        )
 
     def _pd_steer(self, error, d_error, heading, kp_scale=1.0):
         kp = self._KP * max(0.2, min(1.2, float(kp_scale)))
@@ -1276,11 +1332,6 @@ class LineFollower:
         return self._clip(base, -self._MAX_STEER, self._MAX_STEER)
 
     def _compute(self, vals, now, dt):
-        """
-        FOLLOW: PD + heading + pure‑pursuit blend
-        GAP: bias with last seen
-        SEARCH: zig-zag
-        """
         error, conf, heading, curv, wp_err, cam_conf = self._estimate_error_hybrid(vals, now)
         d_err = (error - self._prev_err) / max(dt, 1e-6)
 
@@ -1308,7 +1359,6 @@ class LineFollower:
                     self._search_amp = max(self._search_amp, 18.0 + 40.0 * min(1.0, abs(bias)))
                     self._search_hold_until = now + self._SEARCH_STEP_SEC
 
-        # Curvature-aware speed
         base = int(LINEFOLLOW_BASE_SPEED)
         curv_slow = int(round(base * self._K_CURV_SLOW * curv))
         base_with_curv = max(8, base - curv_slow)
@@ -1317,7 +1367,6 @@ class LineFollower:
             kp_scale = 1.0 - 0.25 * curv
             pd_steer = self._pd_steer(error, d_err, heading, kp_scale=kp_scale)
 
-            # Pure‑pursuit steer from waypoint error; weight by camera confidence
             pp_w = self._PP_BLEND * float(max(0.0, min(1.0, cam_conf)))
             pp_steer = self._clip(self._K_PP * wp_err, -self._MAX_STEER, self._MAX_STEER)
 
@@ -1329,7 +1378,7 @@ class LineFollower:
             bias = self._clip(self._last_seen_pos, -1.0, 1.0)
             target_steer = self._clip(self._last_steer + 25.0 * bias, -self._MAX_STEER, self._MAX_STEER)
 
-        else:  # SEARCH
+        else:
             target_thr = max(10, int(base_with_curv * 0.35))
             if now >= self._search_hold_until:
                 self._search_hold_until = now + self._SEARCH_STEP_SEC
@@ -1337,7 +1386,6 @@ class LineFollower:
             self._search_amp = self._clip(self._search_amp + self._SEARCH_AMP_RATE * dt, 10.0, float(self._MAX_STEER))
             target_steer = self._search_dir * self._search_amp
 
-        # Smooth outputs
         thr = self._slew(self._last_thr, target_thr, self._THR_SLEW, dt)
         steer = self._slew(self._last_steer, target_steer, self._STEER_SLEW, dt)
 
@@ -1359,14 +1407,15 @@ class LineFollower:
                 dt = self._clip(dt, self._DT_MIN, self._DT_MAX)
                 self._last_ts = now
 
-                vals = safe_call(self.px, "get_grayscale_data", log_label="grayscale", default=None)
-                if not isinstance(vals, (list, tuple)) or len(vals) < 3:
-                    socketio.sleep(0.06)
+                jpg, ts = frame_hub.latest()
+                if not jpg or (now - ts) > VISION_MAX_STALENESS:
+                    socketio.sleep(0.03)
                     continue
+
+                vals = None
 
                 thr, st = self._compute(vals, now, dt)
 
-                # respect crash avoidance
                 if auto_state.get("crash_avoid_enabled") and obstacle_state.get("blocked_forward"):
                     thr = 0
 
@@ -1410,15 +1459,13 @@ redirect_app = Flask("redirect_app")
 @redirect_app.route("/", defaults={"path": ""})
 @redirect_app.route("/<path:path>")
 def redirect_to_https(path):
-    host = request.host.split(":")[0] 
-    https_port = os.environ.get("PORT", "443")
-    target = f"https://{host}:{https_port}/{path}"
+    host = request.host.split(":")[0]
+    target = f"https://{host}:{HTTPS_PORT}/{path}"
     return redirect(target, code=301)
 
 def start_redirect_server(host="0.0.0.0", port=80):
     global redirect_server
     from werkzeug.serving import make_server
-
     try:
         srv = make_server(host, port, redirect_app)
         thr = Thread(target=srv.serve_forever, daemon=True)
@@ -1523,7 +1570,6 @@ class PlaybackRunner:
         self._stop = Event()
         self._lock = Lock()
         self._task = None
-        # pause bookkeeping
         self._paused = False
         self._pause_start = None
         self._paused_reason = None
@@ -2186,7 +2232,6 @@ def on_cmd(d):
                 stop_motors_broadcast("forward blocked; stopping", origin="auto_crash", record=True)
             return
         set_steer_throttle(thr, strv)
-        
         try:
             recorder.record_event("drive", {"throttle": thr, "steer": strv})
         except Exception:
@@ -2281,74 +2326,107 @@ def on_disconnect():
 socketio.start_background_task(battery_monitor_loop)
 socketio.start_background_task(obmon.loop)
 
-# ---------- Video ----------
+# ---------- Video (Picamera2) ----------
 class FrameHub:
-    def __init__(self, mjpeg_url=None):
-        self._url = mjpeg_url
-        self._latest = None
-        self._ts = 0.0
-        self._stop = Event()
-        self._lock = Lock()
+    def __init__(self, width=640, height=480, fps=30, jpeg_quality=80, hflip=0, vflip=0, rotation=0):
+        self.width, self.height, self.fps = int(width), int(height), int(fps)
+        self.jpeg_quality = int(jpeg_quality)
+        self.hflip, self.vflip, self.rotation = int(hflip), int(vflip), int(rotation)
+        self._latest, self._ts = None, 0.0
+        self._stop, self._lock = Event(), Lock()
+        self.picam2, self._enc = None, None
         Thread(target=self._run, daemon=True).start()
-
-    def stop(self):
-        self._stop.set()
 
     def latest(self):
         with self._lock:
             return self._latest, self._ts
 
-    def _set_latest(self, jpg_bytes):
-        if not jpg_bytes:
-            return
+    def _push(self, jpg):
+        if not jpg: return
         with self._lock:
-            self._latest = jpg_bytes
-            self._ts = time()
+            self._latest, self._ts = jpg, time()
+
+    def stop(self):
+        self._stop.set()
+
+    def _open(self):
+        if not (Picamera2 and MJPEGEncoder and FileOutput):
+            raise RuntimeError("Picamera2 MJPEG pipeline not available")
+
+        self.picam2 = Picamera2()
+        tform = None
+        if Transform:
+            try: tform = Transform(hflip=bool(self.hflip), vflip=bool(self.vflip), rotation=self.rotation)
+            except Exception: tform = None
+        cfg_kwargs = {"transform": tform} if tform is not None else {}
+        self.picam2.configure(self.picam2.create_video_configuration(
+            main={"size": (self.width, self.height), "format": "YUV420"}, **cfg_kwargs
+        ))
+        try: self.picam2.set_controls({"FrameRate": self.fps})
+        except Exception: pass
+        self.picam2.start()
+
+        class Sink(io.BufferedIOBase):
+            def __init__(self, cb):
+                self.cb, self.buf, self.max_buf = cb, bytearray(), 2_000_000
+            def writable(self): return True
+            def write(self, b):
+                if not b: return 0
+                self.buf.extend(b)
+                if len(self.buf) > self.max_buf:
+                    keep = self.buf[-2:]; self.buf.clear(); self.buf.extend(keep)
+                while True:
+                    i = self.buf.find(b"\xff\xd8")
+                    if i < 0:
+                        if len(self.buf) > 2: del self.buf[:-2]
+                        return len(b)
+                    if i: del self.buf[:i]
+                    j = self.buf.find(b"\xff\xd9", 2)
+                    if j < 0: return len(b)
+                    frame = bytes(self.buf[:j+2]); del self.buf[:j+2]
+                    try: self.cb(frame)
+                    except Exception: pass
+            def flush(self): pass
+            def close(self): 
+                try: self.buf.clear()
+                except Exception: pass
+
+        self._enc = MJPEGEncoder()
+        try:
+            if hasattr(self._enc, "quality"): self._enc.quality = self.jpeg_quality
+            elif hasattr(self._enc, "set_quality"): self._enc.set_quality(self.jpeg_quality)
+        except Exception: pass
+
+        self.picam2.start_recording(self._enc, FileOutput(Sink(self._push)))
+        log.info("Camera started (HW MJPEG) %dx%d@%sfps q=%s (hflip=%s vflip=%s rot=%s)",
+                 self.width, self.height, self.fps, self.jpeg_quality, self.hflip, self.vflip, self.rotation)
+
+    def _close(self):
+        try:
+            if self.picam2:
+                try: self.picam2.stop_recording()
+                except Exception: pass
+                try: self.picam2.stop()
+                except Exception: pass
+                try: self.picam2.close()
+                except Exception: pass
+        finally:
+            self.picam2, self._enc = None, None
+            log.info("Camera closed successfully.")
 
     def _run(self):
-        while not self._stop.is_set():
-            if self._url and requests:
-                self._pull_mjpeg(self._url)
-            else:
-                sleep(0.25)
-
-    def _pull_mjpeg(self, url):
-        r = None
         try:
-            r = requests.get(url, stream=True, timeout=(3.0, 6.0))
-            if r.status_code != 200:
-                return
-            buf = b""
-            for chunk in r.iter_content(chunk_size=8192):
-                if self._stop.is_set():
-                    break
-                if not chunk:
-                    continue
-                buf += chunk
-                while True:
-                    a = buf.find(b"\xff\xd8")
-                    if a < 0:
-                        if len(buf) > 1024*1024:
-                            buf = buf[-4096:]
-                        break
-                    bpos = buf.find(b"\xff\xd9", a + 2)
-                    if bpos < 0:
-                        if a > 0:
-                            buf = buf[a:]
-                        break
-                    jpg = buf[a:bpos+2]
-                    self._set_latest(jpg)
-                    buf = buf[bpos+2:]
-        except Exception:
-            sleep(0.2)
+            self._open()
+        except Exception as e:
+            log.warning("Failed to start camera: %s", e)
+            return
+        try:
+            while not self._stop.is_set():
+                sleep(0.02)
         finally:
-            try:
-                if r:
-                    r.close()
-            except Exception:
-                pass
+            self._close()
 
-frame_hub = FrameHub(VILIB_MJPG_URL)
+frame_hub = FrameHub(width=PICAM_W, height=PICAM_H, fps=PICAM_FPS, jpeg_quality=80, hflip=PICAM_HFLIP, vflip=PICAM_VFLIP, rotation=PICAM_ROT)
 
 @app.route("/video_feed")
 def video_feed():
@@ -2356,31 +2434,30 @@ def video_feed():
 
     def generate():
         last_ts = 0.0
-        target_fps = 20.0
-        min_dt = 1.0 / target_fps
-        last_annotated_ts = 0.0
-        last_annotated = None
-
         while True:
             jpg, ts = frame_hub.latest()
             if jpg is None:
-                sleep(0.02)
+                sleep(0.01)
                 continue
             if ts == last_ts:
-                sleep(0.005)
+                sleep(0.002)
                 continue
             last_ts = ts
 
             out_jpg = jpg
             try:
-                if auto_state.get("line_follow_enabled") and cv2 and np:
-                    if ts == last_annotated_ts and last_annotated is not None:
-                        out_jpg = last_annotated
+                if cv2 and np and auto_state.get("line_follow_enabled"):
+                    now = time()
+                    with vision_cache_lock:
+                        cache_ts = float(vision_overlay_cache.get("ts", 0.0))
+                    fresh = (now - cache_ts) <= float(STREAM_OVERLAY_STALENESS)
+
+                    if fresh:
+                        out_jpg = camera_overlay_from_cache(jpg)
                     else:
-                        annotated = camera_overlay_on_jpg(jpg)
-                        last_annotated = annotated
-                        last_annotated_ts = ts
-                        out_jpg = annotated
+                        out_jpg = jpg
+                else:
+                    out_jpg = jpg
             except Exception:
                 out_jpg = jpg
 
@@ -2392,7 +2469,6 @@ def video_feed():
                 out_jpg + b"\r\n"
             )
             yield part
-            sleep(min_dt)
 
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -2431,10 +2507,6 @@ def cleanup():
         if px and hasattr(px, "stop"):
             px.stop()
     except Exception: pass
-    try:
-        if Vilib and hasattr(Vilib, "camera_close"):
-            Vilib.camera_close()
-    except Exception: pass
     try: music_control("stop")
     except Exception: pass
     try:
@@ -2463,12 +2535,11 @@ if __name__ == "__main__":
         ssl_ctx = None
         if os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
             ssl_ctx = (TLS_CERT, TLS_KEY)
-            port = int(os.environ.get("PORT", "443"))#
-            http_port = int(os.environ.get("PORT", "80"))
+            port = HTTPS_PORT
             log.info("Starting on https://0.0.0.0:%s (TLS enabled)", port)
-            start_redirect_server(host="0.0.0.0", port=http_port)
+            start_redirect_server(host="0.0.0.0", port=HTTP_PORT)
         else:
-            port = int(os.environ.get("PORT", "80"))
+            port = HTTP_PORT
             log.info("Starting on http://0.0.0.0:%s", port)
         socketio.run(app, host="0.0.0.0", port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True, ssl_context=ssl_ctx)
     finally:
