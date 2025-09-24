@@ -29,8 +29,6 @@ Picamera2 = optional_import("picamera2", "Picamera2")
 Transform = optional_import("libcamera", "Transform")
 MJPEGEncoder = optional_import("picamera2.encoders", "MJPEGEncoder")
 FileOutput    = optional_import("picamera2.outputs", "FileOutput")
-
-# ximgproc is always available per user
 ximgproc = cv2.ximgproc if cv2 and hasattr(cv2, "ximgproc") else None
 
 # ---------- Config ----------
@@ -83,16 +81,16 @@ STREAM_OVERLAY_MAX_HZ = 6.0
 STREAM_OVERLAY_STALENESS = 0.30
 
 # Picamera2 config
-PICAM_W = int(os.environ.get("PICAM_W", "640"))
-PICAM_H = int(os.environ.get("PICAM_H", "480"))
-PICAM_FPS = int(os.environ.get("PICAM_FPS", "60"))
-PICAM_HFLIP = int(os.environ.get("PICAM_HFLIP", "0"))
-PICAM_VFLIP = int(os.environ.get("PICAM_VFLIP", "0"))
-PICAM_ROT = int(os.environ.get("PICAM_ROT", "0"))
+PICAM_W = 640
+PICAM_H = 480
+PICAM_FPS = 30
+PICAM_HFLIP = 0
+PICAM_VFLIP = 0
+PICAM_ROT = 0
 
 # Ports
-HTTPS_PORT = int(os.environ.get("HTTPS_PORT", "443"))
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "80"))
+HTTPS_PORT = 443
+HTTP_PORT = 80
 
 # Photo folder
 try:
@@ -105,8 +103,8 @@ os.makedirs(PHOTO_FOLDER, exist_ok=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDING_FILE = os.path.join(BASE_DIR, "recording.json")
-TLS_CERT = os.environ.get("TLS_CERT", os.path.join(BASE_DIR, "server.crt"))
-TLS_KEY  = os.environ.get("TLS_KEY",  os.path.join(BASE_DIR, "server.key"))
+TLS_CERT = os.path.join(BASE_DIR, "server.crt")
+TLS_KEY  = os.path.join(BASE_DIR, "server.key")
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -123,10 +121,6 @@ connected_clients = set()
 _last_broadcast_input = {"throttle": None, "steer": None, "pan": None, "tilt": None}
 last_controller_sid = None
 redirect_server = None
-
-# Shared overlay cache to avoid re-running detection for stream overlay
-vision_overlay_cache = {"ts": 0.0, "dbg": None, "err": 0.0, "conf": 0.0, "heading": 0.0}
-vision_cache_lock = Lock()
 
 def clamp(x, a, b):
     try:
@@ -427,30 +421,15 @@ def prune_photos(max_photos=MAX_PHOTOS):
         log.debug("prune_photos failed: %s", e)
 
 def take_photo():
-    name = f"photo_{strftime('%Y-%m-%d-%H-%M-%S', localtime(time()))}.jpg"
-    path = os.path.join(PHOTO_FOLDER, name)
     try:
-        # Prefer the latest JPEG already encoded for streaming
-        jpg, ts = frame_hub.latest()
-        if jpg:
+        if jpg := frame_hub.latest()[0]:
+            path = os.path.join(PHOTO_FOLDER, f"photo_{strftime('%Y-%m-%d-%H-%M-%S', localtime(time()))}.jpg")
             with open(path, "wb") as f:
                 f.write(jpg)
             prune_photos()
             return path
-
-        # Fallback: capture from Picamera2 directly
-        if hasattr(frame_hub, "picam2") and frame_hub.picam2 and cv2 and np:
-            rgb = frame_hub.picam2.capture_array("main")
-            if rgb is not None and rgb.size > 0:
-                ok, enc = cv2.imencode(".jpg", rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                if ok:
-                    with open(path, "wb") as f:
-                        f.write(enc.tobytes())
-                    prune_photos()
-                    return path
     except Exception as e:
         log.warning("take_photo failed: %s", e)
-    return None
 
 # ---------- Automation: Obstacle monitor ----------
 class ObstacleMonitor:
@@ -1741,7 +1720,7 @@ body{display:flex;flex-direction:column;min-height:100vh}
 .main::before{content:"";position:absolute;inset:0;margin:auto;pointer-events:none;background:radial-gradient(1200px 600px at 50% 40%,rgba(255,255,255,0.02),rgba(255,255,255,0.008) 20%,transparent 60%);mix-blend-mode:overlay;opacity:.8;border-radius:0;z-index:0}
 .header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--solid-bg);border-bottom:1px solid rgba(255,255,255,0.02);z-index:3}
 .logo{display:flex;align-items:center;gap:12px}
-.logo img{height:44px;width:auto;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.logo img{height:44px;width:auto;border-radius:8px}
 .brand{font-weight:700;font-size:15px;color:var(--cream);letter-spacing:1px}
 .sub{font-size:11px;color:var(--muted);margin-top:3px;font-weight:600}
 .footer{flex:0 0 auto;padding:16px 14px;text-align:center;color:var(--muted);font-size:13px;border-top:1px solid rgba(255,255,255,0.02);background:var(--solid-bg);position:relative;z-index:2}
@@ -1825,7 +1804,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
 <body>
 <div class="header">
   <div class="logo">
-    <img src="{{ url_for('static', filename='cosmocrew-logo.png') }}" alt="Cosmocrew logo">
+    <img src="{{ url_for('static', filename='cosmocrew-logo.webp') }}" width="400" height="400" alt="Cosmocrew logo">
     <div>
       <div class="brand">COSMOCREW</div>
       <div class="sub">Mars Rover WebControl</div>
@@ -1846,7 +1825,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
   <div class="container">
     <!-- Live view on the left -->
     <div class="card video-card">
-      <img id="videoFeed" src="/video_feed" alt="video feed" />
+      <img id="videoFeed" width="640" height="480" src="/video_feed" alt="video feed" />
     </div>
 
     <!-- Controls on the right (control-inner + spacer to expand if needed) -->
@@ -2354,6 +2333,14 @@ class FrameHub:
             raise RuntimeError("Picamera2 MJPEG pipeline not available")
 
         self.picam2 = Picamera2()
+        self.picam2.set_controls({
+            "AeEnable": True,
+            "AeExposureMode": 1,
+            "AeMeteringMode": 2,
+            "AwbEnable": True,
+            "AwbMode": 0,
+        })
+        self.picam2.set_controls({"AeFlickerMode": 1, "AeFlickerPeriod": 50})
         tform = None
         if Transform:
             try: tform = Transform(hflip=bool(self.hflip), vflip=bool(self.vflip), rotation=self.rotation)
@@ -2447,15 +2434,7 @@ def video_feed():
             out_jpg = jpg
             try:
                 if cv2 and np and auto_state.get("line_follow_enabled"):
-                    now = time()
-                    with vision_cache_lock:
-                        cache_ts = float(vision_overlay_cache.get("ts", 0.0))
-                    fresh = (now - cache_ts) <= float(STREAM_OVERLAY_STALENESS)
-
-                    if fresh:
-                        out_jpg = camera_overlay_from_cache(jpg)
-                    else:
-                        out_jpg = jpg
+                    out_jpg = camera_overlay_from_cache(jpg)
                 else:
                     out_jpg = jpg
             except Exception:
@@ -2496,8 +2475,6 @@ def recent_photos():
 def cleanup():
     log.info("Cleaning up hardware resources...")
     try: playback.stop("shutdown")
-    except Exception: pass
-    try: linef.stop("shutdown")
     except Exception: pass
     try: mot.shutdown()
     except Exception: pass
