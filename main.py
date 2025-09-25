@@ -1108,16 +1108,11 @@ class LineFollower:
                     continue
 
                 thr, st = self._compute(None, now, dt)
-                if auto_state.get("crash_avoid_enabled") and obstacle_state.get("blocked_forward"):
-                    if thr > 0:
-                        thr = 0
-                    if self._last_thr > 0:
-                        try:
-                            mot.stop()  # immediate motor halt
-                        except Exception:
-                            pass
+                if obstacle_state.get("blocked_forward") and auto_state.get("crash_avoid_enabled"):
+                    set_steer_throttle(0)
+                else:
+                    set_steer_throttle(thr, st)
 
-                set_steer_throttle(thr, st)
                 broadcast_input({"throttle": thr, "steer": st, "_origin": origin})
                 recorder.record_event("drive", {"throttle": thr, "steer": st})
             except Exception as e:
