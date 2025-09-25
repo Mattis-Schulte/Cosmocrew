@@ -106,18 +106,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDING_FILE = os.path.join(BASE_DIR, "recording.json")
 TLS_CERT = os.path.join(BASE_DIR, "server.crt")
 TLS_KEY  = os.path.join(BASE_DIR, "server.key")
-<<<<<<< HEAD
-
-# IR fusion and calibration
-IR_CALIB_FILE = os.path.join(BASE_DIR, "ir_calib.json")
-IR_POLL_HZ = 60.0
-IR_EMA_ALPHA = 0.28
-IR_MIN_VALID_DT = 0.20
-IR_GAMMA = 1.8
-IR_CONF_MIN = 0.18
-IR_HEADING_GAIN = 0.6
-=======
->>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -135,7 +123,6 @@ _last_broadcast_input = {"throttle": None, "steer": None, "pan": None, "tilt": N
 last_controller_sid = None
 redirect_server = None
 
-<<<<<<< HEAD
 # Vision overlay cache (thread-safe)
 vision_cache_lock = Lock()
 vision_overlay_cache = {
@@ -148,8 +135,6 @@ vision_overlay_cache = {
     "ov_jpg": None,      # pre-encoded JPEG with overlay drawn on the matching frame
 }
 
-=======
->>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
 def clamp(x, a, b):
     try:
         return max(a, min(b, int(x)))
@@ -511,10 +496,11 @@ class ObstacleMonitor:
                 if changed:
                     emit_obstacle_state()
                     if obstacle_state["blocked_forward"]:
-                        if auto_state.get("crash_avoid_enabled") and playback.is_playing():
-                            playback.pause("obstacle_detected")
-                        if state.get("throttle", 0) > 0:
-                            stop_motors_broadcast("obstacle detected", origin="auto_crash", record=True)
+                        if auto_state.get("crash_avoid_enabled"):
+                            if playback.is_playing():
+                                playback.pause("obstacle_detected")
+                            if state.get("throttle", 0) > 0:
+                                stop_motors_broadcast("obstacle detected", origin="auto_crash", record=True)
                     else:
                         if playback.is_playing() and playback.is_paused():
                             playback.resume("obstacle_cleared")
@@ -627,163 +613,6 @@ def poly_rmse(ys, xs, coefs):
     xfit = np.polyval(coefs, ys)
     return float(np.sqrt(np.mean((xfit - xs) ** 2)))
 
-class IRSensorReader:
-    def __init__(self, picarx, calib_path, ema_alpha=IR_EMA_ALPHA, gamma=IR_GAMMA, poll_hz=IR_POLL_HZ):
-        self.px = picarx
-        self.calib_path = calib_path
-        self.ema_alpha = float(ema_alpha)
-        self.gamma = float(gamma)
-        self.poll_dt = 1.0 / max(1.0, float(poll_hz))
-
-        self._lock = Lock()
-        self._stop = Event()
-        self._ema = None
-        self._last_err = 0.0
-        self._last_ts = 0.0
-
-        self._latest = {"err": 0.0, "conf": 0.0, "heading": 0.0, "ts": 0.0, "vs": None, "pos": "none"}
-        self._calib = self._load_calib()
-
-        if self.px:
-            Thread(target=self._loop, daemon=True).start()
-
-    def _load_calib(self):
-        d = _load_json(self.calib_path) or {}
-        if  not isinstance(d.get("channels"), list) or len(d["channels"]) != 3:
-            floor = d.get("floor"); line = d.get("line")
-            if isinstance(floor, list) and isinstance(line, list) and len(floor) == 3 and len(line) == 3:
-                ch = []
-                for i in range(3):
-                    f = float(floor[i]); l = float(line[i])
-                    lo = min(f, l); hi = max(f, l)
-                    ch.append({
-                        "floor": {"mean": f, "std": 8.0, "min": lo, "max": hi},
-                        "line":  {"mean": l, "std": 8.0, "min": lo, "max": hi},
-                        "delta": (l - f),
-                        "polarity": "light" if l > f else "dark",
-                        "sep": abs(l - f) / max(1.0, (8.0**2 + 8.0**2) ** 0.5)
-                    })
-                return {"channels": ch, "gamma": d.get("gamma", IR_GAMMA)}
-            return None
-        return d
-
-    def calibrated(self):
-        return bool(self._calib and isinstance(self._calib.get("channels"), list) and len(self._calib["channels"]) == 3)
-
-    @staticmethod
-    def _saturate(raw, lo, hi):
-        if lo > hi:
-            lo, hi = hi, lo
-        return lo if raw < lo else hi if raw > hi else raw
-
-    def _normalize_line_score(self, raw3):
-        """
-        Map raw ADCs -> vs in [0,1], where 0~floor, 1~line.
-        Uses robust clamping by min/max from multi-surface calibration and scales over delta.
-        """
-        if not self.calibrated():
-            return None
-        vs = []
-        for i in range(3):
-            ch = self._calib["channels"][i]
-            f = ch["floor"]["mean"]; l = ch["line"]["mean"]
-            fmin, fmax = ch["floor"]["min"], ch["floor"]["max"]
-            lmin, lmax = ch["line"]["min"], ch["line"]["max"]
-            delta = float(l - f)
-            if abs(delta) < 1e-6:
-                return None
-            # robust clamp within observed range
-            lo = min(fmin, lmin)
-            hi = max(fmax, lmax)
-            rv = self._saturate(float(raw3[i]), lo, hi)
-            # scale
-            r = (rv - f) / delta
-            # if delta < 0, r naturally flips sign; clamp still fine.
-            r = 0.0 if r < 0.0 else 1.0 if r > 1.0 else r
-            vs.append(r)
-        return vs
-
-    @staticmethod
-    def _centroid_soft(vs, gamma):
-        wL = max(0.0, min(1.0, vs[0])) ** gamma
-        wC = max(0.0, min(1.0, vs[1])) ** gamma
-        wR = max(0.0, min(1.0, vs[2])) ** gamma
-        s = wL + wC + wR
-        if s < 1e-6:
-            return 0.0, 0.0, 0.0
-        x = (-1.0 * wL + 0.0 * wC + 1.0 * wR) / s
-        contrast = (max(vs) - min(vs))
-        peakiness = (max(wL, wC, wR) / s)
-        conf = max(0.0, min(1.0, 0.6 * contrast + 0.4 * peakiness))
-        return x, conf, s
-
-    def latest(self):
-        with self._lock:
-            return self._latest.copy()
-
-    def stop(self):
-        self._stop.set()
-
-    def _loop(self):
-        while not self._stop.is_set():
-            t0 = time()
-            try:
-                raw = self.px.get_grayscale_data() if self.px and hasattr(self.px, "get_grayscale_data") else None
-                if raw and len(raw) == 3:
-                    # EMA per channel to tame spikes
-                    if self._ema is None:
-                        self._ema = [float(raw[0]), float(raw[1]), float(raw[2])]
-                    else:
-                        a = self.ema_alpha
-                        for i in range(3):
-                            self._ema[i] = (1.0 - a) * self._ema[i] + a * float(raw[i])
-
-                    vs = self._normalize_line_score(self._ema)
-                    if vs is not None:
-                        err, conf_base, _ = self._centroid_soft(vs, self.gamma)
-                        # Boost confidence by per-channel separation quality if available
-                        try:
-                            seps = [max(0.0, float(ch.get("sep", 0.0))) for ch in self._calib.get("channels", [])]
-                            sep_avg = sum(seps) / max(1, len(seps))
-                            conf = max(0.0, min(1.0, 0.7 * conf_base + 0.3 * max(0.0, min(1.0, sep_avg / 2.5))))
-                        except Exception:
-                            conf = conf_base
-                        now = t0
-                        dt = max(1e-3, now - self._last_ts) if self._last_ts > 0 else 0.05
-                        heading = (err - self._last_err) / dt
-                        heading = max(-1.0, min(1.0, IR_HEADING_GAIN * heading))
-                        # IR position classification (which sensor is strongest)
-                        pos = "none"
-                        try:
-                            mx = max(vs)
-                            if mx >= 0.25:  # threshold to consider line detected on a channel
-                                idx = int(vs.index(mx))
-                                pos = ("left", "center", "right")[idx]
-                        except Exception:
-                            pos = "none"
-                        with self._lock:
-                            self._latest.update({
-                                "err": float(err),
-                                "conf": float(conf),
-                                "heading": float(heading),
-                                "ts": now,
-                                "vs": [round(float(v), 3) for v in vs],
-                                "pos": pos
-                            })
-                        self._last_err = err
-                        self._last_ts = now
-                    else:
-                        with self._lock:
-                            self._latest.update({"conf": 0.0, "ts": t0, "vs": None, "pos": "none"})
-                else:
-                    with self._lock:
-                        self._latest.update({"conf": 0.0, "ts": t0, "vs": None, "pos": "none"})
-            except Exception:
-                pass
-            sleep(max(0.0, self.poll_dt - (time() - t0)))
-
-ir_reader = IRSensorReader(px, calib_path=IR_CALIB_FILE)
-
 # ---------- Vision overlay helpers ----------
 def _frame_sig(jpg_bytes: bytes) -> int:
     try:
@@ -797,15 +626,14 @@ def _frame_sig(jpg_bytes: bytes) -> int:
         return (len(jpg_bytes) << 32)
 
 def _draw_overlay_on_image(img, dbg, err, conf, heading):
-    """Draw diagnostic overlay.
+    """Draw diagnostic overlay (vision only).
 
     Elements:
-      ROI rectangle (cyan): region of interest used for line detection in the lower part of the frame.
-      Green contour: largest candidate white line blob after masking & morphology.
-      Yellow/orange polyline: fitted polynomial path (source noted by +thin for skeleton, +seam for seam-trace, else mask).
-      Waypoint (orange filled + blue ring): lookahead target used for pure-pursuit blending with PD steering.
-      Top label: err (normalized lateral error, -1 left .. +1 right), conf (camera confidence 0..1), hd (normalized heading / derivative), and source tag.
-      Second label (if IR data available): IR channel normalized intensities (0~floor,1~line), interpreted position (left/center/right/none), ir_err, ir_conf.
+      ROI rectangle (cyan): region of interest used for line detection.
+      Green contour: largest candidate white line blob.
+      Yellow/orange polyline: fitted polynomial path.
+      Waypoint marker: lookahead target for steering.
+      Top label: err (lateral error), conf (camera confidence), hd (heading / derivative), source tag.
     """
     try:
         oh, ow = img.shape[:2]
@@ -839,24 +667,6 @@ def _draw_overlay_on_image(img, dbg, err, conf, heading):
         label += " +thin" if src == "skel" else (" +seam" if src == "seam" else "")
         base_y = max(20, oy0 - 8)
         cv2.putText(img, label, (10, base_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
-
-        # IR line (second row)
-        try:
-            if ir_reader:
-                ir = ir_reader.latest()
-                if ir and (time() - ir.get("ts", 0.0)) <= 1.0:
-                    vs = ir.get("vs")
-                    pos = ir.get("pos", "none")
-                    ir_err = float(ir.get("err", 0.0))
-                    ir_conf = float(ir.get("conf", 0.0))
-                    if vs:
-                        ir_txt = f"IR: [{','.join(f'{v:.2f}' for v in vs)}] pos={pos} ir_err={ir_err:+.2f} ir_conf={ir_conf:.2f}"
-                        cv2.putText(img, ir_txt, (10, base_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 160), 1, cv2.LINE_AA)
-                    else:
-                        ir_txt = f"IR: pos={pos} ir_err={ir_err:+.2f} ir_conf={ir_conf:.2f}"
-                        cv2.putText(img, ir_txt, (10, base_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 160), 1, cv2.LINE_AA)
-        except Exception:
-            pass
     except Exception:
         pass
     return img
@@ -1163,7 +973,7 @@ class LineFollower:
     def start(self):
         if self.running or not self.px:
             if not self.px:
-                log.info("Line follow unavailable (no sensors).")
+                log.info("Line follow unavailable (no robot hardware).")
             return False
         self._stop.clear()
         self.running = True
@@ -1207,60 +1017,24 @@ class LineFollower:
 
     def _estimate_error_cam(self, now):
         if not _CV_ON:
-            return 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         vc = self._vision_cache
         if now - vc["ts"] < VISION_MIN_DT:
-            return vc["err"], vc["conf"], vc["heading"], vc.get("curv", 0.0), vc.get("wp_err", 0.0)
-
+            return vc["err"], vc["conf"], vc["heading"], vc.get("curv", 0.0), vc.get("wp_err", 0.0), vc["conf"]
         err, conf, heading, curv, wp_err = camera_line_metrics()
         err_pred = max(-1.0, min(1.0, err + 0.35 * heading * self._CAM_LOOKAHEAD / 0.1))
         vc.update({"ts": now, "err": float(err_pred), "conf": float(conf),
                    "heading": float(heading), "curv": float(curv), "wp_err": float(wp_err)})
-        return err_pred, conf, heading, curv, wp_err
-
-    def _estimate_error_hybrid(self, vals, now):
-        err_cam, conf_cam, heading_cam, curv, wp_err = self._estimate_error_cam(now)
-
-        e_ir, c_ir, h_ir = 0.0, 0.0, 0.0
-        try:
-            if ir_reader:
-                ir = ir_reader.latest()
-                if ir and (now - float(ir.get("ts", 0.0))) <= IR_MIN_VALID_DT:
-                    e_ir = float(ir.get("err", 0.0))
-                    c_ir = float(ir.get("conf", 0.0))
-                    h_ir = float(ir.get("heading", 0.0))
-        except Exception:
-            pass
-
-        v_norm = max(0.0, min(1.0, abs(state.get("throttle", 0)) / 100.0))
-        w_cam = 0.15 + 0.75 * conf_cam - 0.25 * curv + 0.15 * v_norm
-        w_cam = 0.0 if w_cam < 0.0 else 1.0 if w_cam > 1.0 else w_cam
-        w_ir = (1.0 - w_cam) * (0.0 if c_ir < 0.0 else 1.0 if c_ir > 1.0 else c_ir)
-
-        if conf_cam < IR_CONF_MIN and c_ir >= IR_CONF_MIN:
-            w_ir = max(w_ir, 0.8); w_cam = min(w_cam, 0.2)
-        elif c_ir < IR_CONF_MIN and conf_cam >= IR_CONF_MIN:
-            w_cam = max(w_cam, 0.8); w_ir = min(w_ir, 0.2)
-
-        den = (w_cam + w_ir) if (w_cam + w_ir) > 1e-6 else 1.0
-        err = (w_cam * err_cam + w_ir * e_ir) / den
-        heading = (w_cam * heading_cam + 0.4 * w_ir * h_ir) / (w_cam + 0.4 * w_ir + 1e-6)
-
-        err = -1.0 if err < -1.0 else 1.0 if err > 1.0 else err
-        heading = -1.0 if heading < -1.0 else 1.0 if heading > 1.0 else heading
-
-        agree = 1.0 - min(1.0, abs(err_cam - e_ir))
-        conf = max(conf_cam, c_ir) * (0.9 + 0.1 * agree)
-        conf = 0.0 if conf < 0.0 else 1.0 if conf > 1.0 else conf
-
-        return err, conf, heading, curv, wp_err, conf_cam
+        return err_pred, conf, heading, curv, wp_err, conf  # last value is cam_conf for downstream blending
 
     def _pd_steer(self, error, d_error, heading, kp_scale=1.0):
         kp = self._KP * max(0.2, min(1.2, float(kp_scale)))
-        return self._clip(kp * error + self._KD * d_error + self._KH * heading, -self._MAX_STEER, self._MAX_STEER)
+        base = kp * error + self._KD * d_error + self._KH * heading
+        return self._clip(base, -self._MAX_STEER, self._MAX_STEER)
+
 
     def _compute(self, vals, now, dt):
-        error, conf, heading, curv, wp_err, cam_conf = self._estimate_error_hybrid(vals, now)
+        error, conf, heading, curv, wp_err, cam_conf = self._estimate_error_cam(now)
         d_err = (error - self._prev_err) / max(dt, 1e-6)
 
         saw_line = conf >= self._CONF_THRESHOLD
@@ -1288,7 +1062,7 @@ class LineFollower:
                     self._search_hold_until = now + self._SEARCH_STEP_SEC
 
         base = int(LINEFOLLOW_BASE_SPEED)
-        base_with_curv = max(8, base - int(round(base * self._K_CURV_SLOW * curv)))
+        base_with_curv = base - int(round(base * self._K_CURV_SLOW * curv))
 
         if self._mode == "FOLLOW":
             kp_scale = 1.0 - 0.25 * curv
@@ -1311,7 +1085,6 @@ class LineFollower:
 
         thr = self._slew(self._last_thr, target_thr, self._THR_SLEW, dt)
         steer = self._slew(self._last_steer, target_steer, self._STEER_SLEW, dt)
-
         self._last_thr = thr
         self._last_steer = steer
         self._prev_err = error
@@ -1336,13 +1109,19 @@ class LineFollower:
 
                 thr, st = self._compute(None, now, dt)
                 if auto_state.get("crash_avoid_enabled") and obstacle_state.get("blocked_forward"):
-                    thr = 0
+                    if thr > 0:
+                        thr = 0
+                    if self._last_thr > 0:
+                        try:
+                            mot.stop()  # immediate motor halt
+                        except Exception:
+                            pass
 
                 set_steer_throttle(thr, st)
                 broadcast_input({"throttle": thr, "steer": st, "_origin": origin})
                 recorder.record_event("drive", {"throttle": thr, "steer": st})
             except Exception as e:
-                log.debug("Line follower step failed: %s", e)
+                log.info("Line follower step failed: %s", e)
             socketio.sleep(0.01)
 
 linef = LineFollower(px)
@@ -2063,6 +1842,7 @@ function isDriveNeutral(){const thr=+(_p?.thr||0),str=+(_p?.str||0),pn=Math.abs(
 </script>
 </body></html>
 """
+
 @app.route("/")
 def index():
     return render_template_string(PAGE,
@@ -2367,7 +2147,6 @@ def video_feed():
             last_ts = ts
 
             try:
-<<<<<<< HEAD
                 if auto_state.get("line_follow_enabled"):
                     # Recompute overlay on the current frame at a capped rate so signatures match.
                     now = time()
@@ -2377,9 +2156,7 @@ def video_feed():
                         except Exception:
                             pass
                         last_ov_compute = now
-=======
                 if cv2 and np and auto_state.get("line_follow_enabled"):
->>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
                     out_jpg = camera_overlay_from_cache(jpg)
                 else:
                     out_jpg = jpg
