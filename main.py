@@ -5,6 +5,7 @@ import math
 import signal
 import json
 import logging
+import zlib
 from time import time, sleep, strftime, localtime
 from threading import Thread, Event, Lock
 
@@ -105,6 +106,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDING_FILE = os.path.join(BASE_DIR, "recording.json")
 TLS_CERT = os.path.join(BASE_DIR, "server.crt")
 TLS_KEY  = os.path.join(BASE_DIR, "server.key")
+<<<<<<< HEAD
+
+# IR fusion and calibration
+IR_CALIB_FILE = os.path.join(BASE_DIR, "ir_calib.json")
+IR_POLL_HZ = 60.0
+IR_EMA_ALPHA = 0.28
+IR_MIN_VALID_DT = 0.20
+IR_GAMMA = 1.8
+IR_CONF_MIN = 0.18
+IR_HEADING_GAIN = 0.6
+=======
+>>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -122,6 +135,21 @@ _last_broadcast_input = {"throttle": None, "steer": None, "pan": None, "tilt": N
 last_controller_sid = None
 redirect_server = None
 
+<<<<<<< HEAD
+# Vision overlay cache (thread-safe)
+vision_cache_lock = Lock()
+vision_overlay_cache = {
+    "ts": 0.0,
+    "err": 0.0,
+    "conf": 0.0,
+    "heading": 0.0,
+    "dbg": None,
+    "frame_sig": None,   # signature of the JPEG bytes this overlay was computed for
+    "ov_jpg": None,      # pre-encoded JPEG with overlay drawn on the matching frame
+}
+
+=======
+>>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
 def clamp(x, a, b):
     try:
         return max(a, min(b, int(x)))
@@ -136,6 +164,13 @@ def safe_set(label, fn, value):
         fn(int(value))
     except Exception as e:
         log.warning("%s failed: %s", label, e)
+
+def _load_json(path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def broadcast_input(payload, force=False):
     global _last_broadcast_input
@@ -493,8 +528,11 @@ def _ensure_odd(x):
     xi = int(max(1, round(x)))
     return xi if xi % 2 == 1 else xi + 1
 
+_CV_ON = bool(cv2 and np)
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if _CV_ON else None
+
 def compute_whiteness(roi_bgr):
-    if not cv2 or not np:
+    if not _CV_ON:
         return None
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     H, S, V = cv2.split(hsv)
@@ -505,54 +543,54 @@ def compute_whiteness(roi_bgr):
     lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0].astype(np.float32) / 255.0
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        Lc = clahe.apply((L * 255).astype(np.uint8)).astype(np.float32) / 255.0
+        Lc = _clahe.apply((L * 255).astype(np.uint8)).astype(np.float32) / 255.0 if _clahe else L
     except Exception:
         Lc = L
-
     w = 0.55 * w_hsv + 0.45 * Lc
     return np.clip(w, 0.0, 1.0)
 
 def ridge_center_response(gray_u8):
-    if not cv2 or not np:
+    if not _CV_ON:
         return None
     g32 = gray_u8.astype(np.float32) / 255.0
     lap = cv2.Laplacian(g32, cv2.CV_32F, ksize=3)
     r = -lap
-    mn, mx = float(np.min(r)), float(np.max(r))
+    try:
+        mn, mx, _, _ = cv2.minMaxLoc(r)
+    except Exception:
+        mn, mx = float(np.min(r)), float(np.max(r))
     if mx - mn < 1e-6:
         return np.zeros_like(r, dtype=np.float32)
     r = (r - mn) / (mx - mn)
-    r = cv2.GaussianBlur(r, (3, 3), 0)
-    return r
+    return cv2.GaussianBlur(r, (3, 3), 0)
 
 def thin_mask(mask):
-    if not ximgproc or not VISION_USE_THINNING:
+    if not (_CV_ON and ximgproc and VISION_USE_THINNING):
         return None
     try:
         m = (mask > 0).astype(np.uint8) * 255
         skel = ximgproc.thinning(m, thinningType=getattr(ximgproc, "THINNING_ZHANGSUEN", 0))
-        skel = cv2.morphologyEx(skel, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        return skel
+        return cv2.morphologyEx(skel, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
     except Exception:
         return None
 
-def build_cost_map(roi_bgr, gray_u8):
-    W = compute_whiteness(roi_bgr)  # [0..1]
-    if W is None:
-        W = (gray_u8.astype(np.float32) / 255.0)
-    R = ridge_center_response(gray_u8)
-    if R is None:
-        R = np.zeros_like(W, dtype=np.float32)
+def build_cost_map(roi_bgr, gray_u8, whiten=None, ridge=None):
+    if whiten is None:
+        whiten = compute_whiteness(roi_bgr)
+    W = whiten if whiten is not None else (gray_u8.astype(np.float32) / 255.0)
+
+    if ridge is None:
+        ridge = ridge_center_response(gray_u8)
+    R = ridge if ridge is not None else np.zeros_like(W, dtype=np.float32)
+
     try:
         edges = cv2.Canny(gray_u8, VISION_CANNY_LO, VISION_CANNY_HI)
-        E = (edges > 0).astype(np.float32)
-        E = cv2.GaussianBlur(E, (5, 5), 0)
+        E = cv2.GaussianBlur((edges > 0).astype(np.float32), (5, 5), 0)
     except Exception:
         E = np.zeros_like(W, dtype=np.float32)
+
     score = VISION_SEAM_W_WHITE * W + VISION_SEAM_W_RIDGE * R + VISION_SEAM_W_EDGE * E
-    score = np.clip(score, 0.0, 1.0)
-    cost = 1.0 - score
+    cost = 1.0 - np.clip(score, 0.0, 1.0)
     return cost, score
 
 def seam_trace(cost, start_x, step=2, win=28, dx_max=None):
@@ -560,20 +598,15 @@ def seam_trace(cost, start_x, step=2, win=28, dx_max=None):
     ys, xs = [], []
     y = h - 1
     x = int(np.clip(start_x, 0, w - 1))
-    if dx_max is None:
-        dx_max = max(6, int(round(w * 0.02)))
+    dxm = max(6, int(round(w * 0.02))) if dx_max is None else int(dx_max)
     while y >= 0:
-        x0 = max(0, x - win)
-        x1 = min(w - 1, x + win)
+        x0, x1 = max(0, x - win), min(w - 1, x + win)
         row = cost[y, x0:x1+1]
-        offsets = np.arange(x0, x1 + 1) - x
-        penalty = (offsets.astype(np.float32) / max(1.0, dx_max)) ** 2
-        penalty = np.clip(penalty, 0.0, 4.0)
-        scores = row + 0.15 * penalty
-        idx = int(np.argmin(scores))
+        offsets = np.arange(x0, x1 + 1, dtype=np.float32) - x
+        penalty = np.clip((offsets / max(1.0, dxm)) ** 2, 0.0, 4.0)
+        idx = int(np.argmin(row + 0.15 * penalty))
         x = x0 + idx
-        xs.append(float(x))
-        ys.append(float(y))
+        xs.append(float(x)); ys.append(float(y))
         y -= step
     return xs, ys
 
@@ -581,15 +614,12 @@ def contour_aspect_and_tilt(contour):
     if contour is None or len(contour) < 5:
         return None, None
     rect = cv2.minAreaRect(contour)
-    (w, h) = rect[1]
+    w, h = rect[1]
     if w < 1 or h < 1:
         return None, None
     aspect = max(h, w) / max(1.0, min(h, w))
     ang = float(rect[2])
-    if w < h:
-        tilt_from_vertical = abs(ang)
-    else:
-        tilt_from_vertical = abs(ang + 90.0)
+    tilt_from_vertical = abs(ang) if w < h else abs(ang + 90.0)
     tilt_from_vertical = min(tilt_from_vertical, 180.0 - tilt_from_vertical)
     return float(aspect), float(tilt_from_vertical)
 
@@ -597,15 +627,260 @@ def poly_rmse(ys, xs, coefs):
     xfit = np.polyval(coefs, ys)
     return float(np.sqrt(np.mean((xfit - xs) ** 2)))
 
+class IRSensorReader:
+    def __init__(self, picarx, calib_path, ema_alpha=IR_EMA_ALPHA, gamma=IR_GAMMA, poll_hz=IR_POLL_HZ):
+        self.px = picarx
+        self.calib_path = calib_path
+        self.ema_alpha = float(ema_alpha)
+        self.gamma = float(gamma)
+        self.poll_dt = 1.0 / max(1.0, float(poll_hz))
+
+        self._lock = Lock()
+        self._stop = Event()
+        self._ema = None
+        self._last_err = 0.0
+        self._last_ts = 0.0
+
+        self._latest = {"err": 0.0, "conf": 0.0, "heading": 0.0, "ts": 0.0, "vs": None, "pos": "none"}
+        self._calib = self._load_calib()
+
+        if self.px:
+            Thread(target=self._loop, daemon=True).start()
+
+    def _load_calib(self):
+        d = _load_json(self.calib_path) or {}
+        if  not isinstance(d.get("channels"), list) or len(d["channels"]) != 3:
+            floor = d.get("floor"); line = d.get("line")
+            if isinstance(floor, list) and isinstance(line, list) and len(floor) == 3 and len(line) == 3:
+                ch = []
+                for i in range(3):
+                    f = float(floor[i]); l = float(line[i])
+                    lo = min(f, l); hi = max(f, l)
+                    ch.append({
+                        "floor": {"mean": f, "std": 8.0, "min": lo, "max": hi},
+                        "line":  {"mean": l, "std": 8.0, "min": lo, "max": hi},
+                        "delta": (l - f),
+                        "polarity": "light" if l > f else "dark",
+                        "sep": abs(l - f) / max(1.0, (8.0**2 + 8.0**2) ** 0.5)
+                    })
+                return {"channels": ch, "gamma": d.get("gamma", IR_GAMMA)}
+            return None
+        return d
+
+    def calibrated(self):
+        return bool(self._calib and isinstance(self._calib.get("channels"), list) and len(self._calib["channels"]) == 3)
+
+    @staticmethod
+    def _saturate(raw, lo, hi):
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo if raw < lo else hi if raw > hi else raw
+
+    def _normalize_line_score(self, raw3):
+        """
+        Map raw ADCs -> vs in [0,1], where 0~floor, 1~line.
+        Uses robust clamping by min/max from multi-surface calibration and scales over delta.
+        """
+        if not self.calibrated():
+            return None
+        vs = []
+        for i in range(3):
+            ch = self._calib["channels"][i]
+            f = ch["floor"]["mean"]; l = ch["line"]["mean"]
+            fmin, fmax = ch["floor"]["min"], ch["floor"]["max"]
+            lmin, lmax = ch["line"]["min"], ch["line"]["max"]
+            delta = float(l - f)
+            if abs(delta) < 1e-6:
+                return None
+            # robust clamp within observed range
+            lo = min(fmin, lmin)
+            hi = max(fmax, lmax)
+            rv = self._saturate(float(raw3[i]), lo, hi)
+            # scale
+            r = (rv - f) / delta
+            # if delta < 0, r naturally flips sign; clamp still fine.
+            r = 0.0 if r < 0.0 else 1.0 if r > 1.0 else r
+            vs.append(r)
+        return vs
+
+    @staticmethod
+    def _centroid_soft(vs, gamma):
+        wL = max(0.0, min(1.0, vs[0])) ** gamma
+        wC = max(0.0, min(1.0, vs[1])) ** gamma
+        wR = max(0.0, min(1.0, vs[2])) ** gamma
+        s = wL + wC + wR
+        if s < 1e-6:
+            return 0.0, 0.0, 0.0
+        x = (-1.0 * wL + 0.0 * wC + 1.0 * wR) / s
+        contrast = (max(vs) - min(vs))
+        peakiness = (max(wL, wC, wR) / s)
+        conf = max(0.0, min(1.0, 0.6 * contrast + 0.4 * peakiness))
+        return x, conf, s
+
+    def latest(self):
+        with self._lock:
+            return self._latest.copy()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            t0 = time()
+            try:
+                raw = self.px.get_grayscale_data() if self.px and hasattr(self.px, "get_grayscale_data") else None
+                if raw and len(raw) == 3:
+                    # EMA per channel to tame spikes
+                    if self._ema is None:
+                        self._ema = [float(raw[0]), float(raw[1]), float(raw[2])]
+                    else:
+                        a = self.ema_alpha
+                        for i in range(3):
+                            self._ema[i] = (1.0 - a) * self._ema[i] + a * float(raw[i])
+
+                    vs = self._normalize_line_score(self._ema)
+                    if vs is not None:
+                        err, conf_base, _ = self._centroid_soft(vs, self.gamma)
+                        # Boost confidence by per-channel separation quality if available
+                        try:
+                            seps = [max(0.0, float(ch.get("sep", 0.0))) for ch in self._calib.get("channels", [])]
+                            sep_avg = sum(seps) / max(1, len(seps))
+                            conf = max(0.0, min(1.0, 0.7 * conf_base + 0.3 * max(0.0, min(1.0, sep_avg / 2.5))))
+                        except Exception:
+                            conf = conf_base
+                        now = t0
+                        dt = max(1e-3, now - self._last_ts) if self._last_ts > 0 else 0.05
+                        heading = (err - self._last_err) / dt
+                        heading = max(-1.0, min(1.0, IR_HEADING_GAIN * heading))
+                        # IR position classification (which sensor is strongest)
+                        pos = "none"
+                        try:
+                            mx = max(vs)
+                            if mx >= 0.25:  # threshold to consider line detected on a channel
+                                idx = int(vs.index(mx))
+                                pos = ("left", "center", "right")[idx]
+                        except Exception:
+                            pos = "none"
+                        with self._lock:
+                            self._latest.update({
+                                "err": float(err),
+                                "conf": float(conf),
+                                "heading": float(heading),
+                                "ts": now,
+                                "vs": [round(float(v), 3) for v in vs],
+                                "pos": pos
+                            })
+                        self._last_err = err
+                        self._last_ts = now
+                    else:
+                        with self._lock:
+                            self._latest.update({"conf": 0.0, "ts": t0, "vs": None, "pos": "none"})
+                else:
+                    with self._lock:
+                        self._latest.update({"conf": 0.0, "ts": t0, "vs": None, "pos": "none"})
+            except Exception:
+                pass
+            sleep(max(0.0, self.poll_dt - (time() - t0)))
+
+ir_reader = IRSensorReader(px, calib_path=IR_CALIB_FILE)
+
+# ---------- Vision overlay helpers ----------
+def _frame_sig(jpg_bytes: bytes) -> int:
+    try:
+        n = len(jpg_bytes)
+        head = jpg_bytes[:4096]
+        tail = jpg_bytes[-4096:]
+        c1 = zlib.crc32(head) & 0xFFFFFFFF
+        c2 = zlib.crc32(tail) & 0xFFFFFFFF
+        return ((n & 0xFFFFFFFF) << 32) ^ ((c1 & 0xFFFF) << 16) ^ (c2 & 0xFFFF)
+    except Exception:
+        return (len(jpg_bytes) << 32)
+
+def _draw_overlay_on_image(img, dbg, err, conf, heading):
+    """Draw diagnostic overlay.
+
+    Elements:
+      ROI rectangle (cyan): region of interest used for line detection in the lower part of the frame.
+      Green contour: largest candidate white line blob after masking & morphology.
+      Yellow/orange polyline: fitted polynomial path (source noted by +thin for skeleton, +seam for seam-trace, else mask).
+      Waypoint (orange filled + blue ring): lookahead target used for pure-pursuit blending with PD steering.
+      Top label: err (normalized lateral error, -1 left .. +1 right), conf (camera confidence 0..1), hd (normalized heading / derivative), and source tag.
+      Second label (if IR data available): IR channel normalized intensities (0~floor,1~line), interpreted position (left/center/right/none), ir_err, ir_conf.
+    """
+    try:
+        oh, ow = img.shape[:2]
+        scale = float(dbg.get("scale", 1.0))
+        y0 = int(dbg.get("y0", 0)); y1 = int(dbg.get("y1", int(round(oh * scale * VISION_ROI_H_FRAC))))
+        contour = dbg.get("contour")
+        poly = dbg.get("poly"); wp = dbg.get("wp")
+        invs = 1.0 / max(1e-6, scale)
+
+        oy0 = int(round(y0 * invs)); oy1 = int(round(y1 * invs))
+        cv2.rectangle(img, (0, oy0), (ow - 1, oy1), (40, 220, 255), VISION_DRAW_THICK)
+
+        if contour is not None:
+            c_abs = contour.copy()
+            c_abs[:, 0, 1] = c_abs[:, 0, 1] + y0
+            c_orig = np.array(c_abs[:, 0, :] * invs, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.drawContours(img, [c_orig], -1, (0, 255, 0), VISION_DRAW_THICK)
+
+        if poly and isinstance(poly.get("curve"), list) and len(poly["curve"]) >= 2:
+            pts = np.array([[int(round(xx * invs)), int(round((yy + y0) * invs))] for (xx, yy) in poly["curve"]],
+                           dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], False, (255, 180, 60), 2, cv2.LINE_AA)
+
+        if wp and "x" in wp and "y" in wp:
+            ox = int(round(float(wp["x"]) * invs)); oy = int(round(float(wp["y"]) * invs))
+            cv2.circle(img, (ox, oy), 6, (200, 120, 20), -1)
+            cv2.circle(img, (ox, oy), 10, (60, 140, 255), 2)
+
+        src = poly.get("src") if poly else None
+        label = f"err={err:+.2f} conf={conf:.2f} hd={heading:+.2f}"
+        label += " +thin" if src == "skel" else (" +seam" if src == "seam" else "")
+        base_y = max(20, oy0 - 8)
+        cv2.putText(img, label, (10, base_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
+
+        # IR line (second row)
+        try:
+            if ir_reader:
+                ir = ir_reader.latest()
+                if ir and (time() - ir.get("ts", 0.0)) <= 1.0:
+                    vs = ir.get("vs")
+                    pos = ir.get("pos", "none")
+                    ir_err = float(ir.get("err", 0.0))
+                    ir_conf = float(ir.get("conf", 0.0))
+                    if vs:
+                        ir_txt = f"IR: [{','.join(f'{v:.2f}' for v in vs)}] pos={pos} ir_err={ir_err:+.2f} ir_conf={ir_conf:.2f}"
+                        cv2.putText(img, ir_txt, (10, base_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 160), 1, cv2.LINE_AA)
+                    else:
+                        ir_txt = f"IR: pos={pos} ir_err={ir_err:+.2f} ir_conf={ir_conf:.2f}"
+                        cv2.putText(img, ir_txt, (10, base_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 160), 1, cv2.LINE_AA)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return img
+
 # ---------- Vision detection ----------
+def _norm_x_to_err(x, w_minus1):
+    return float(max(-1.0, min(1.0, (x / max(1.0, w_minus1)) * 2.0 - 1.0)))
+
+def _apply_morph(mask, w, roi_h):
+    kx = _ensure_odd(max(3, int(round(w * 0.01))))
+    ky = _ensure_odd(max(7, int(round(roi_h * 0.06))))
+    kclose = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+    m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kclose, iterations=1)
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
 def vision_detect_white_line(jpg_bytes):
-    if not cv2 or not np or not jpg_bytes:
+    if not (_CV_ON and jpg_bytes):
         return 0.0, 0.0, 0.0, None
     try:
         arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
         orig = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if orig is None or orig.size == 0:
             return 0.0, 0.0, 0.0, None
+        frame_signature = _frame_sig(jpg_bytes)
 
         oh, ow = orig.shape[:2]
         if ow <= 0 or oh <= 0:
@@ -615,26 +890,23 @@ def vision_detect_white_line(jpg_bytes):
         if scale < 0.99:
             proc = cv2.resize(orig, (VISION_DOWNSCALE_WIDTH, int(round(oh * scale))), interpolation=cv2.INTER_AREA)
         else:
-            proc = orig
-            scale = 1.0
+            proc = orig; scale = 1.0
 
         h, w = proc.shape[:2]
-
         roi_h = int(round(h * VISION_ROI_H_FRAC))
-        y1 = h
-        y0 = max(0, y1 - roi_h)
+        y1 = h; y0 = max(0, y1 - roi_h)
         if roi_h <= 4:
             return 0.0, 0.0, 0.0, None
         roi = proc[y0:y1, :]
+        w_minus1 = w - 1
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
         whiten = compute_whiteness(roi)
-        gray_u8 = gray
-        ridge = ridge_center_response(gray_u8)
+        ridge = ridge_center_response(gray)
 
-        whit_u8 = (np.clip(whiten * 255.0, 0, 255).astype(np.uint8))
+        whit_u8 = (np.clip(whiten * 255.0, 0, 255).astype(np.uint8)) if whiten is not None else gray
         if VISION_USE_TOPHAT:
             k = max(3, int(VISION_TOPHAT_K) | 1)
             se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
@@ -645,56 +917,37 @@ def vision_detect_white_line(jpg_bytes):
             _, white = cv2.threshold(whit_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         try:
-            edges = cv2.Canny(gray_u8, VISION_CANNY_LO, VISION_CANNY_HI)
+            edges = cv2.Canny(gray, VISION_CANNY_LO, VISION_CANNY_HI)
         except Exception:
-            edges = np.zeros_like(gray_u8, dtype=np.uint8)
-        edges_d = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-        white_d = cv2.dilate(white, np.ones((3,3), np.uint8), iterations=1)
+            edges = np.zeros_like(gray, dtype=np.uint8)
+        edges_d = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        white_d = cv2.dilate(white, np.ones((3, 3), np.uint8), iterations=1)
         band = cv2.bitwise_and(edges_d, white_d)
 
-        mask = cv2.bitwise_or(white, band)
-        kx = _ensure_odd(max(3, int(round(w * 0.01))))
-        ky = _ensure_odd(max(7, int(round(roi_h * 0.06))))
-        kclose = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kclose, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+        mask = _apply_morph(cv2.bitwise_or(white, band), w, roi_h)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        centroid = None
-        contour = None
-        err = 0.0
-        conf = 0.0
-        heading_norm = 0.0
-        poly_info = None
-        wp_info = None
+        centroid = None; contour = None
+        err = 0.0; conf = 0.0; heading_norm = 0.0
+        poly_info = None; wp_info = None
 
         if contours:
             areas = [cv2.contourArea(c) for c in contours]
             idx = int(np.argmax(areas))
-            c = contours[idx]
-            area = max(1.0, areas[idx])
+            c = contours[idx]; area = max(1.0, areas[idx])
             roi_area = float(mask.shape[0] * mask.shape[1])
             area_ratio = area / max(1.0, roi_area)
-
             if area_ratio >= VISION_MIN_AREA_RATIO:
                 M = cv2.moments(c)
                 if abs(M["m00"]) >= 1e-6:
-                    cx = float(M["m10"] / M["m00"])
-                    cy = float(M["m01"] / M["m00"])
-                    centroid = (cx, cy)
-                    contour = c
-                    err_centroid = (cx / max(1.0, w - 1)) * 2.0 - 1.0
-                    err = float(max(-1.0, min(1.0, err_centroid)))
+                    cx = float(M["m10"] / M["m00"]); cy = float(M["m01"] / M["m00"])
+                    centroid = (cx, cy); contour = c
+                    err = _norm_x_to_err(cx, w_minus1)
                     conf = _cam_confidence_from_mask(mask, area_ratio)
-
                     try:
                         asp, tilt_v = contour_aspect_and_tilt(contour)
-                        penalty = 0.0
-                        if asp is not None and asp < float(VISION_ASPECT_MIN):
-                            penalty += 0.35
-                        if tilt_v is not None and tilt_v > float(VISION_MAX_TILT_DEG):
-                            penalty += 0.25
+                        penalty = (0.35 if (asp is not None and asp < float(VISION_ASPECT_MIN)) else 0.0) + \
+                                  (0.25 if (tilt_v is not None and tilt_v > float(VISION_MAX_TILT_DEG)) else 0.0)
                         if penalty > 0.0:
                             conf = max(0.0, conf * (1.0 - penalty))
                             if penalty >= 0.60:
@@ -702,20 +955,18 @@ def vision_detect_white_line(jpg_bytes):
                     except Exception:
                         pass
 
-        src_kind = None
-        used_pts = None
+        src_kind = None; used_pts = None
 
         skel = thin_mask(mask)
         if skel is not None:
             nz_skel = np.column_stack(np.nonzero(skel))
             if nz_skel.shape[0] >= VISION_THIN_MIN_PTS:
-                used_pts = nz_skel
-                src_kind = "skel"
+                used_pts = nz_skel; src_kind = "skel"
 
         if used_pts is None and VISION_USE_SEAM:
-            cost, score = build_cost_map(roi, gray_u8)
+            cost, score = build_cost_map(roi, gray, whiten=whiten, ridge=ridge)
             band_h = max(6, int(0.10 * cost.shape[0]))
-            bottom_band = np.mean(score[cost.shape[0]-band_h:,:], axis=0)
+            bottom_band = np.mean(score[cost.shape[0] - band_h:, :], axis=0)
             start_x = int(np.argmax(bottom_band))
             xs, ys = seam_trace(cost, start_x, step=VISION_SEAM_STEP, win=VISION_SEAM_WIN)
             if len(xs) >= 8:
@@ -726,46 +977,39 @@ def vision_detect_white_line(jpg_bytes):
         if used_pts is None:
             nz_mask = np.column_stack(np.nonzero(mask))
             if nz_mask.shape[0] > 0:
-                used_pts = nz_mask
-                src_kind = "mask"
+                used_pts = nz_mask; src_kind = "mask"
 
         if used_pts is not None and used_pts.shape[0] > 0:
             pts = used_pts
             if pts.shape[0] > VISION_MAX_POINTS_FIT:
                 sel = np.random.choice(pts.shape[0], VISION_MAX_POINTS_FIT, replace=False)
                 pts = pts[sel]
-            ys = pts[:, 0].astype(np.float32)
-            xs = pts[:, 1].astype(np.float32)
+            ys = pts[:, 0].astype(np.float32); xs = pts[:, 1].astype(np.float32)
             try:
                 coefs = np.polyfit(ys, xs, 3)
-                yb = float((y1 - y0) - 1)
-
+                yb = float(roi_h - 1)
                 m = 3.0 * coefs[0] * (yb ** 2) + 2.0 * coefs[1] * yb + coefs[2]
-                heading_norm = math.atan(float(m)) / (math.pi / 4.0)
-                heading_norm = float(max(-1.0, min(1.0, heading_norm)))
-
+                heading_norm = float(max(-1.0, min(1.0, math.atan(float(m)) / (math.pi / 4.0))))
                 x_fit_bottom = float(np.polyval(coefs, yb))
-                err_poly = (x_fit_bottom / max(1.0, w - 1)) * 2.0 - 1.0
-                err = float(max(-1.0, min(1.0, err_poly)))
+                err = _norm_x_to_err(x_fit_bottom, w_minus1)
 
                 LOOKAHEAD_PX = float(os.environ.get("PP_LOOKAHEAD_PX", "42"))
                 y_wp = max(0.0, yb - LOOKAHEAD_PX)
                 x_wp = float(np.polyval(coefs, y_wp))
-                err_wp = float(max(-1.0, min(1.0, (x_wp / max(1.0, w - 1)) * 2.0 - 1.0)))
-                wp_info = {"x": x_wp, "y": y_wp + y0, "err": err_wp}
+                wp_err = _norm_x_to_err(x_wp, w_minus1)
+                wp_info = {"x": x_wp, "y": y_wp + y0, "err": wp_err}
 
                 samp = max(12, int(VISION_POLY_SAMPLES))
-                ys_lin = np.linspace(0.0, (y1 - y0) - 1.0, samp)
+                ys_lin = np.linspace(0.0, yb, samp)
                 xs_fit = np.polyval(coefs, ys_lin)
                 curve_pts = [(float(xx), float(yy)) for yy, xx in zip(ys_lin, xs_fit)]
-                poly_info = {"coefs": tuple([float(v) for v in coefs]),
+                poly_info = {"coefs": tuple(float(v) for v in coefs),
                              "slope_bottom": float(m),
                              "curve": curve_pts,
                              "src": src_kind}
-
                 try:
                     rmse = poly_rmse(ys, xs, coefs)
-                    cover_frac = (max(ys) - min(ys)) / max(1.0, (y1 - y0))
+                    cover_frac = (max(ys) - min(ys)) / max(1.0, roi_h)
                     if rmse > float(VISION_POLY_RMSE_MAX) or cover_frac < float(VISION_MIN_VERTICAL_COVER_FRAC):
                         conf = max(0.0, conf * 0.25)
                 except Exception:
@@ -773,11 +1017,16 @@ def vision_detect_white_line(jpg_bytes):
             except Exception:
                 pass
 
-        debug = {
-            "scale": scale, "proc_w": w, "proc_h": h, "y0": y0, "y1": y1,
-            "centroid": centroid, "contour": contour,
-            "poly": poly_info, "wp": wp_info
-        }
+        debug = {"scale": scale, "proc_w": w, "proc_h": h, "y0": y0, "y1": y1,
+                 "centroid": centroid, "contour": contour, "poly": poly_info, "wp": wp_info}
+
+        ov_jpg = None
+        try:
+            ov_img = _draw_overlay_on_image(orig.copy(), debug, err, conf, heading_norm)
+            ok, enc = cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok: ov_jpg = enc.tobytes()
+        except Exception:
+            ov_jpg = None
 
         try:
             with vision_cache_lock:
@@ -786,6 +1035,8 @@ def vision_detect_white_line(jpg_bytes):
                 vision_overlay_cache["err"] = float(err)
                 vision_overlay_cache["conf"] = float(conf)
                 vision_overlay_cache["heading"] = float(heading_norm)
+                vision_overlay_cache["frame_sig"] = frame_signature
+                vision_overlay_cache["ov_jpg"] = ov_jpg
         except Exception:
             pass
 
@@ -793,187 +1044,23 @@ def vision_detect_white_line(jpg_bytes):
     except Exception:
         return 0.0, 0.0, 0.0, None
 
-def camera_overlay_on_jpg(jpg_bytes):
-    if not cv2 or not np or not jpg_bytes:
-        return jpg_bytes
-    try:
-        err, conf, heading, dbg = vision_detect_white_line(jpg_bytes)
-        arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None or img.size == 0:
-            return jpg_bytes
-
-        oh, ow = img.shape[:2]
-        if not dbg:
-            return jpg_bytes
-
-        scale = float(dbg.get("scale", 1.0))
-        y0 = int(dbg.get("y0", 0))
-        y1 = int(dbg.get("y1", int(round(oh * scale * VISION_ROI_H_FRAC))))
-        centroid = dbg.get("centroid", None)
-        contour = dbg.get("contour", None)
-        poly = dbg.get("poly", None)
-        wp = dbg.get("wp", None)
-
-        oy0 = int(round(y0 / max(1e-6, scale)))
-        oy1 = int(round(y1 / max(1e-6, scale)))
-        cv2.rectangle(img, (0, oy0), (ow - 1, oy1), (40, 220, 255), VISION_DRAW_THICK)
-
-        if contour is not None and centroid is not None:
-            c = contour
-            cx, cy = centroid
-            c_abs = c.copy()
-            c_abs[:, 0, 1] = c_abs[:, 0, 1] + y0
-            if scale != 0:
-                c_orig = np.array(c_abs[:, 0, :] / scale, dtype=np.int32).reshape(-1, 1, 2)
-            else:
-                c_orig = c_abs
-            cv2.drawContours(img, [c_orig], -1, (0, 255, 0), VISION_DRAW_THICK)
-            ocx = int(round(cx / max(1e-6, scale)))
-            ocy = int(round((cy + y0) / max(1e-6, scale)))
-            cv2.circle(img, (ocx, ocy), 6, (0, 0, 255), -1)
-
-        if poly and isinstance(poly.get("curve"), list) and len(poly["curve"]) >= 2:
-            pts = []
-            for (xx, yy) in poly["curve"]:
-                ox = int(round(xx / max(1e-6, scale)))
-                oy = int(round((yy + y0) / max(1e-6, scale)))
-                pts.append([ox, oy])
-            pts = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(img, [pts], isClosed=False, color=(255, 180, 60), thickness=2, lineType=cv2.LINE_AA)
-
-        if wp and "x" in wp and "y" in wp:
-            ox = int(round(float(wp["x"]) / max(1e-6, scale)))
-            oy = int(round(float(wp["y"]) / max(1e-6, scale)))
-            cv2.circle(img, (ox, oy), 6, (200, 120, 20), -1)
-            cv2.circle(img, (ox, oy), 10, (60, 140, 255), 2)
-
-        src = poly.get("src") if poly else None
-        label = f"err={err:+.2f} conf={conf:.2f} hd={heading:+.2f}"
-        if src == "skel":
-            label += " +thin"
-        elif src == "seam":
-            label += " +seam"
-        cv2.putText(img, label, (10, max(20, oy0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
-
-        ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if ok:
-            return enc.tobytes()
-        return jpg_bytes
-    except Exception:
-        return jpg_bytes
-
 def camera_overlay_from_cache(jpg_bytes):
-    if not cv2 or not np or not jpg_bytes:
+    if not (_CV_ON and jpg_bytes):
         return jpg_bytes
     try:
+        sig = _frame_sig(jpg_bytes)
         with vision_cache_lock:
-            cache = dict(vision_overlay_cache)
-        dbg = cache.get("dbg")
-        if not dbg:
-            return jpg_bytes
-        err = cache.get("err", 0.0)
-        conf = cache.get("conf", 0.0)
-        heading = cache.get("heading", 0.0)
-
-        arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None or img.size == 0:
-            return jpg_bytes
-
-        oh, ow = img.shape[:2]
-        scale = float(dbg.get("scale", 1.0))
-        y0 = int(dbg.get("y0", 0))
-        y1 = int(dbg.get("y1", int(round(oh * scale * VISION_ROI_H_FRAC))))
-        centroid = dbg.get("centroid", None)
-        contour = dbg.get("contour", None)
-        poly = dbg.get("poly", None)
-        wp = dbg.get("wp", None)
-
-        oy0 = int(round(y0 / max(1e-6, scale)))
-        oy1 = int(round(y1 / max(1e-6, scale)))
-        cv2.rectangle(img, (0, oy0), (ow - 1, oy1), (40, 220, 255), VISION_DRAW_THICK)
-
-        if contour is not None and centroid is not None:
-            c = contour
-            cx, cy = centroid
-            c_abs = c.copy()
-            c_abs[:, 0, 1] = c_abs[:, 0, 1] + y0
-            if scale != 0:
-                c_orig = np.array(c_abs[:, 0, :] / scale, dtype=np.int32).reshape(-1, 1, 2)
-            else:
-                c_orig = c_abs
-            cv2.drawContours(img, [c_orig], -1, (0, 255, 0), VISION_DRAW_THICK)
-            ocx = int(round(cx / max(1e-6, scale)))
-            ocy = int(round((cy + y0) / max(1e-6, scale)))
-            cv2.circle(img, (ocx, ocy), 6, (0, 0, 255), -1)
-
-        if poly and isinstance(poly.get("curve"), list) and len(poly["curve"]) >= 2:
-            pts = []
-            for (xx, yy) in poly["curve"]:
-                ox = int(round(xx / max(1e-6, scale)))
-                oy = int(round((yy + y0) / max(1e-6, scale)))
-                pts.append([ox, oy])
-            pts = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(img, [pts], isClosed=False, color=(255, 180, 60), thickness=2, lineType=cv2.LINE_AA)
-
-        if wp and "x" in wp and "y" in wp:
-            ox = int(round(float(wp["x"]) / max(1e-6, scale)))
-            oy = int(round(float(wp["y"]) / max(1e-6, scale)))
-            cv2.circle(img, (ox, oy), 6, (200, 120, 20), -1)
-            cv2.circle(img, (ox, oy), 10, (60, 140, 255), 2)
-
-        src = poly.get("src") if poly else None
-        label = f"err={err:+.2f} conf={conf:.2f} hd={heading:+.2f}"
-        if src == "skel":
-            label += " +thin"
-        elif src == "seam":
-            label += " +seam"
-        cv2.putText(img, label, (10, max(20, oy0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 230, 100), 2, cv2.LINE_AA)
-
-        ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if ok:
-            return enc.tobytes()
+            cache_sig = vision_overlay_cache.get("frame_sig")
+            ov = vision_overlay_cache.get("ov_jpg")
+            ts = vision_overlay_cache.get("ts", 0.0)
+        # If we have a fresh overlay, prefer it. Signature match is ideal, but not required.
+        if ov and (time() - ts) <= STREAM_OVERLAY_STALENESS:
+            return ov if cache_sig == sig else ov
         return jpg_bytes
     except Exception:
         return jpg_bytes
 
 def camera_line_metrics():
-    try:
-        jpg, ts = frame_hub.latest()
-        if not jpg or (time() - ts) > VISION_MAX_STALENESS:
-            return 0.0, 0.0, 0.0, 0.0
-        err, conf, heading, dbg = vision_detect_white_line(jpg)
-        curv = 0.0
-        try:
-            poly = dbg.get("poly") if dbg else None
-            if poly and isinstance(poly.get("coefs"), (list, tuple)):
-                coefs = list(poly["coefs"])
-                deg = len(coefs) - 1
-                y0 = float(dbg.get("y0", 0))
-                y1 = float(dbg.get("y1", 0))
-                yb = max(0.0, (y1 - y0) - 1.0)
-                y_up = max(0.0, yb - 40.0)
-                def slope(y):
-                    if deg == 1:
-                        return float(coefs[0])
-                    elif deg == 2:
-                        a, b, _ = [float(v) for v in coefs]; return 2.0*a*y + b
-                    elif deg == 3:
-                        a3, a2, a1, _ = [float(v) for v in coefs]; return 3.0*a3*(y**2) + 2.0*a2*y + a1
-                    else:
-                        return 0.0
-                s0 = slope(yb)
-                s1 = slope(y_up)
-                curv = abs(math.atan(s0) - math.atan(s1)) / (math.pi / 2.0)
-                curv = max(0.0, min(1.0, curv))
-        except Exception:
-            curv = 0.0
-        return float(err), float(conf), float(heading), float(curv)
-    except Exception:
-        return 0.0, 0.0, 0.0, 0.0
-
-def camera_line_metrics_v2():
     try:
         jpg, ts = frame_hub.latest()
         if not jpg or (time() - ts) > VISION_MAX_STALENESS:
@@ -986,18 +1073,19 @@ def camera_line_metrics_v2():
             if poly and isinstance(poly.get("coefs"), (list, tuple)):
                 coefs = list(poly["coefs"])
                 deg = len(coefs) - 1
-                y0 = float(dbg.get("y0", 0))
-                y1 = float(dbg.get("y1", 0))
-                yb = max(0.0, (y1 - y0) - 1.0)
-                y_up = max(0.0, yb - 40.0)
-                def slope(y):
-                    if deg == 1: return float(coefs[0])
-                    if deg == 2:
-                        a, b, _ = [float(v) for v in coefs]; return 2.0*a*y + b
-                    if deg == 3:
-                        a3, a2, a1, _ = [float(v) for v in coefs]; return 3.0*a3*(y**2) + 2.0*a2*y + a1
-                    return 0.0
-                s0 = slope(yb); s1 = slope(y_up)
+                y0 = float(dbg.get("y0", 0)); y1 = float(dbg.get("y1", 0))
+                yb = max(0.0, (y1 - y0) - 1.0); y_up = max(0.0, yb - 40.0)
+                if deg == 1:
+                    def slope(y): return float(coefs[0])
+                elif deg == 2:
+                    a, b, _ = [float(v) for v in coefs]
+                    def slope(y): return 2.0 * a * y + b
+                elif deg == 3:
+                    a3, a2, a1, _ = [float(v) for v in coefs]
+                    def slope(y): return 3.0 * a3 * (y ** 2) + 2.0 * a2 * y + a1
+                else:
+                    def slope(y): return 0.0
+                s0, s1 = slope(yb), slope(y_up)
                 curv = abs(math.atan(s0) - math.atan(s1)) / (math.pi / 2.0)
                 curv = max(0.0, min(1.0, curv))
         except Exception:
@@ -1015,165 +1103,16 @@ def camera_line_metrics_v2():
     except Exception:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
-class GrayFrontEnd:
-    def __init__(self, picarx,
-                 ema_alpha=0.35,
-                 med_window=3,
-                 min_hold=0.995,
-                 max_hold=1.005,
-                 pol_hys=0.08):
-        self.px = picarx
-        self.ema_alpha = float(ema_alpha)
-        self.med_window = int(max(1, med_window))
-        self.min_hold = float(min_hold)
-        self.max_hold = float(max_hold)
-        self.pol_hys = float(pol_hys)
-        self.reset()
-
-    def reset(self):
-        self.history = [[ ] for _ in range(3)]
-        self.ema = [None, None, None]
-        self.vmin = [1e9, 1e9, 1e9]
-        self.vmax = [-1e9, -1e9, -1e9]
-        self.polarity = None
-        self._last_pol_score = 0.0
-        self._ready = False
-
-    def _median(self, arr):
-        if not arr:
-            return None
-        s = sorted(arr)
-        n = len(s)
-        return s[n//2] if n % 2 == 1 else 0.5 * (s[n//2 - 1] + s[n//2])
-
-    def _smooth(self, raw):
-        out = []
-        for i, v in enumerate(raw):
-            h = self.history[i]
-            h.append(float(v))
-            if len(h) > self.med_window:
-                del h[0]
-            m = self._median(h) if len(h) >= 1 else float(v)
-            if self.ema[i] is None:
-                self.ema[i] = float(m)
-            else:
-                a = self.ema_alpha
-                self.ema[i] = (1.0 - a) * self.ema[i] + a * float(m)
-            out.append(self.ema[i])
-        return out
-
-    def _update_minmax(self, v):
-        for i in range(3):
-            x = float(v[i])
-            if x < self.vmin[i]:
-                self.vmin[i] = x
-            else:
-                self.vmin[i] = min(self.vmin[i] * self.min_hold, x, self.vmin[i])
-            if x > self.vmax[i]:
-                self.vmax[i] = x
-            else:
-                self.vmax[i] = max(self.vmax[i] * (2.0 - self.max_hold), x, self.vmax[i])
-
-        spans = [max(1e-6, self.vmax[i] - self.vmin[i]) for i in range(3)]
-        self._ready = all(s > 5.0 for s in spans)
-
-    def _normalize_reflectance(self, v):
-        out = []
-        for i in range(3):
-            lo, hi = self.vmin[i], self.vmax[i]
-            span = max(1e-6, hi - lo)
-            r = (float(v[i]) - lo) / span
-            r = 0.0 if r < 0.0 else 1.0 if r > 1.0 else r
-            out.append(r)
-        return out
-
-    def _update_polarity(self, R):
-        L, M, Rr = R
-        neigh = 0.5 * (L + Rr)
-        score = float(M - neigh)
-        if self.polarity is None:
-            if abs(score) > self.pol_hys:
-                self.polarity = 'white' if score > 0 else 'dark'
-                self._last_pol_score = score
-        else:
-            if self.polarity == 'white' and score < -self.pol_hys:
-                self.polarity = 'dark'
-            elif self.polarity == 'dark' and score > self.pol_hys:
-                self.polarity = 'white'
-            self._last_pol_score = score
-
-    def read_raw(self):
-        try:
-            if not self.px or not hasattr(self.px, "get_grayscale_data"):
-                return None
-            v = self.px.get_grayscale_data()
-            if not isinstance(v, (list, tuple)) or len(v) < 3:
-                return None
-            return [float(v[0]), float(v[1]), float(v[2])]
-        except Exception:
-            return None
-
-    def estimate(self, raw_vals=None):
-        if raw_vals is None:
-            raw_vals = self.read_raw()
-            if raw_vals is None:
-                return 0.0, 0.0, self.polarity
-
-        v = self._smooth(raw_vals)
-        self._update_minmax(v)
-        R = self._normalize_reflectance(v)
-        self._update_polarity(R)
-
-        if self.polarity == 'dark':
-            W = [1.0 - R[0], 1.0 - R[1], 1.0 - R[2]]
-        else:
-            W = [R[0], R[1], R[2]]
-
-        wsum = W[0] + W[1] + W[2]
-        if wsum < 1e-4 or not self._ready:
-            return 0.0, 0.0, self.polarity
-
-        x = (-1.0 * W[0] + 0.0 * W[1] + 1.0 * W[2]) / max(1e-6, wsum)
-        x = -1.0 if x < -1.0 else 1.0 if x > 1.0 else x
-
-        contrast = max(W) - min(W)
-        shape = max(0.0, (W[1] - 0.5 * (W[0] + W[2])))
-        conf = 0.55 * contrast + 0.45 * max(0.0, shape)
-        conf = 0.0 if conf < 0.0 else 1.0 if conf > 1.0 else conf
-
-        try:
-            if hasattr(self.px, "get_line_status"):
-                st = self.px.get_line_status(v)
-                if isinstance(st, (list, tuple)) and len(st) >= 3:
-                    Lb, Mb, Rb = int(bool(st[0])), int(bool(st[1])), int(bool(st[2]))
-                    if Mb == 0 or ((Lb == 0) ^ (Rb == 0)):
-                        conf = max(conf, 0.85)
-                        if Mb == 0:
-                            x = 0.0
-                        elif Lb == 0 and Rb != 0:
-                            x = -1.0
-                        elif Rb == 0 and Lb != 0:
-                            x = 1.0
-        except Exception:
-            pass
-
-        return float(x), float(conf), self.polarity
-
 def _cam_confidence_from_mask(mask, area_ratio):
     import numpy as _np
     h, w = mask.shape[:2]
-
     ar_min = max(1e-6, VISION_MIN_AREA_RATIO)
-    ar_max = 0.06
-    ar = (float(area_ratio) - ar_min) / (ar_max - ar_min)
+    ar = (float(area_ratio) - ar_min) / (0.06 - ar_min)
     ar = 0.0 if ar < 0.0 else 1.0 if ar > 1.0 else ar
-
     band_h = max(2, int(0.2 * h))
     band = mask[h - band_h:h, :]
     dens = float(_np.count_nonzero(band)) / float(band.size)
-
-    conf = 0.65 * ar + 0.35 * min(1.0, 3.0 * dens)
-    return float(max(0.0, min(1.0, conf)))
+    return float(max(0.0, min(1.0, 0.65 * ar + 0.35 * min(1.0, 3.0 * dens))))
 
 # ---------- Automation: Line follower ----------
 class LineFollower:
@@ -1218,16 +1157,13 @@ class LineFollower:
 
         self._vision_cache = {"ts": 0.0, "err": 0.0, "conf": 0.0, "heading": 0.0, "curv": 0.0, "wp_err": 0.0}
 
-        self.gfe = GrayFrontEnd(picarx)
-
     def is_running(self):
         return self.running
 
     def start(self):
-        if self.running:
-            return False
-        if not self.px:
-            log.info("Line follow unavailable (no sensors).")
+        if self.running or not self.px:
+            if not self.px:
+                log.info("Line follow unavailable (no sensors).")
             return False
         self._stop.clear()
         self.running = True
@@ -1245,7 +1181,6 @@ class LineFollower:
         self._search_hold_until = now + self._SEARCH_STEP_SEC
         self._last_ts = now
         self._vision_cache = {"ts": 0.0, "err": 0.0, "conf": 0.0, "heading": 0.0, "curv": 0.0, "wp_err": 0.0}
-        self.gfe.reset()
 
         self._task = socketio.start_background_task(self._loop)
         return True
@@ -1270,45 +1205,59 @@ class LineFollower:
             return current - max_step
         return target
 
-    def _estimate_error_ir(self, raw_vals):
-        err, conf, pol = self.gfe.estimate(raw_vals)
-        if pol and self._dark_line is None:
-            self._dark_line = (pol == 'dark')
-        return err, conf
-
     def _estimate_error_cam(self, now):
-        if not cv2 or not np:
+        if not _CV_ON:
             return 0.0, 0.0, 0.0, 0.0, 0.0
-        if now - self._vision_cache["ts"] < VISION_MIN_DT:
-            vc = self._vision_cache
+        vc = self._vision_cache
+        if now - vc["ts"] < VISION_MIN_DT:
             return vc["err"], vc["conf"], vc["heading"], vc.get("curv", 0.0), vc.get("wp_err", 0.0)
-        err, conf, heading, curv, wp_err = camera_line_metrics_v2()
 
+        err, conf, heading, curv, wp_err = camera_line_metrics()
         err_pred = max(-1.0, min(1.0, err + 0.35 * heading * self._CAM_LOOKAHEAD / 0.1))
-
-        self._vision_cache.update({"ts": now,
-                                   "err": float(err_pred),
-                                   "conf": float(conf),
-                                   "heading": float(heading),
-                                   "curv": float(curv),
-                                   "wp_err": float(wp_err)})
+        vc.update({"ts": now, "err": float(err_pred), "conf": float(conf),
+                   "heading": float(heading), "curv": float(curv), "wp_err": float(wp_err)})
         return err_pred, conf, heading, curv, wp_err
 
     def _estimate_error_hybrid(self, vals, now):
-        err, conf, heading, curv, wp_err = self._estimate_error_cam(now)
-        return (
-            self._clip(err, -1.0, 1.0),
-            self._clip(conf, 0.0, 1.0),
-            self._clip(heading, -1.0, 1.0),
-            self._clip(curv, 0.0, 1.0),
-            self._clip(wp_err, -1.0, 1.0),
-            float(conf)
-        )
+        err_cam, conf_cam, heading_cam, curv, wp_err = self._estimate_error_cam(now)
+
+        e_ir, c_ir, h_ir = 0.0, 0.0, 0.0
+        try:
+            if ir_reader:
+                ir = ir_reader.latest()
+                if ir and (now - float(ir.get("ts", 0.0))) <= IR_MIN_VALID_DT:
+                    e_ir = float(ir.get("err", 0.0))
+                    c_ir = float(ir.get("conf", 0.0))
+                    h_ir = float(ir.get("heading", 0.0))
+        except Exception:
+            pass
+
+        v_norm = max(0.0, min(1.0, abs(state.get("throttle", 0)) / 100.0))
+        w_cam = 0.15 + 0.75 * conf_cam - 0.25 * curv + 0.15 * v_norm
+        w_cam = 0.0 if w_cam < 0.0 else 1.0 if w_cam > 1.0 else w_cam
+        w_ir = (1.0 - w_cam) * (0.0 if c_ir < 0.0 else 1.0 if c_ir > 1.0 else c_ir)
+
+        if conf_cam < IR_CONF_MIN and c_ir >= IR_CONF_MIN:
+            w_ir = max(w_ir, 0.8); w_cam = min(w_cam, 0.2)
+        elif c_ir < IR_CONF_MIN and conf_cam >= IR_CONF_MIN:
+            w_cam = max(w_cam, 0.8); w_ir = min(w_ir, 0.2)
+
+        den = (w_cam + w_ir) if (w_cam + w_ir) > 1e-6 else 1.0
+        err = (w_cam * err_cam + w_ir * e_ir) / den
+        heading = (w_cam * heading_cam + 0.4 * w_ir * h_ir) / (w_cam + 0.4 * w_ir + 1e-6)
+
+        err = -1.0 if err < -1.0 else 1.0 if err > 1.0 else err
+        heading = -1.0 if heading < -1.0 else 1.0 if heading > 1.0 else heading
+
+        agree = 1.0 - min(1.0, abs(err_cam - e_ir))
+        conf = max(conf_cam, c_ir) * (0.9 + 0.1 * agree)
+        conf = 0.0 if conf < 0.0 else 1.0 if conf > 1.0 else conf
+
+        return err, conf, heading, curv, wp_err, conf_cam
 
     def _pd_steer(self, error, d_error, heading, kp_scale=1.0):
         kp = self._KP * max(0.2, min(1.2, float(kp_scale)))
-        base = kp * error + self._KD * d_error + self._KH * heading
-        return self._clip(base, -self._MAX_STEER, self._MAX_STEER)
+        return self._clip(kp * error + self._KD * d_error + self._KH * heading, -self._MAX_STEER, self._MAX_STEER)
 
     def _compute(self, vals, now, dt):
         error, conf, heading, curv, wp_err, cam_conf = self._estimate_error_hybrid(vals, now)
@@ -1339,24 +1288,19 @@ class LineFollower:
                     self._search_hold_until = now + self._SEARCH_STEP_SEC
 
         base = int(LINEFOLLOW_BASE_SPEED)
-        curv_slow = int(round(base * self._K_CURV_SLOW * curv))
-        base_with_curv = max(8, base - curv_slow)
+        base_with_curv = max(8, base - int(round(base * self._K_CURV_SLOW * curv)))
 
         if self._mode == "FOLLOW":
             kp_scale = 1.0 - 0.25 * curv
             pd_steer = self._pd_steer(error, d_err, heading, kp_scale=kp_scale)
-
             pp_w = self._PP_BLEND * float(max(0.0, min(1.0, cam_conf)))
             pp_steer = self._clip(self._K_PP * wp_err, -self._MAX_STEER, self._MAX_STEER)
-
             target_steer = self._clip((1.0 - pp_w) * pd_steer + pp_w * pp_steer, -self._MAX_STEER, self._MAX_STEER)
             target_thr = base_with_curv
-
         elif self._mode == "GAP":
             target_thr = max(10, int(base_with_curv * 0.6))
             bias = self._clip(self._last_seen_pos, -1.0, 1.0)
             target_steer = self._clip(self._last_steer + 25.0 * bias, -self._MAX_STEER, self._MAX_STEER)
-
         else:
             target_thr = max(10, int(base_with_curv * 0.35))
             if now >= self._search_hold_until:
@@ -1382,8 +1326,7 @@ class LineFollower:
                 break
             try:
                 now = time()
-                dt = now - self._last_ts
-                dt = self._clip(dt, self._DT_MIN, self._DT_MAX)
+                dt = self._clip(now - self._last_ts, self._DT_MIN, self._DT_MAX)
                 self._last_ts = now
 
                 jpg, ts = frame_hub.latest()
@@ -1391,10 +1334,7 @@ class LineFollower:
                     socketio.sleep(0.03)
                     continue
 
-                vals = None
-
-                thr, st = self._compute(vals, now, dt)
-
+                thr, st = self._compute(None, now, dt)
                 if auto_state.get("crash_avoid_enabled") and obstacle_state.get("blocked_forward"):
                     thr = 0
 
@@ -1531,14 +1471,6 @@ class Recorder:
             return os.path.exists(self.path) and os.path.getsize(self.path) > 0
         except Exception:
             return False
-
-    def load(self):
-        try:
-            with open(self.path, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            log.info("No recording to load or failed: %s", e)
-            return None
 
     def state(self):
         return {"recording": self.recording, "available": self.available()}
@@ -2131,13 +2063,15 @@ function isDriveNeutral(){const thr=+(_p?.thr||0),str=+(_p?.str||0),pn=Math.abs(
 </script>
 </body></html>
 """
-
 @app.route("/")
 def index():
     return render_template_string(PAGE,
-                                  CAM_PAN_MIN=CAM_PAN_MIN, CAM_PAN_MAX=CAM_PAN_MAX,
-                                  CAM_TILT_MIN=CAM_TILT_MIN, CAM_TILT_MAX=CAM_TILT_MAX,
-                                  pan=state.get("pan", 0), tilt=state.get("tilt", 0))
+                                  CAM_PAN_MIN=CAM_PAN_MIN,
+                                  CAM_PAN_MAX=CAM_PAN_MAX,
+                                  CAM_TILT_MIN=CAM_TILT_MIN,
+                                  CAM_TILT_MAX=CAM_TILT_MAX,
+                                  pan=state.get("pan", 0),
+                                  tilt=state.get("tilt", 0))
 
 # ---------- Socket events ----------
 @socketio.on("connect")
@@ -2284,7 +2218,7 @@ def on_playback(d):
             set_line_follow_enabled(False, reason="playback")
         if recorder.recording:
             recorder.stop(save=True)
-        data = recorder.load()
+        data = _load_json(RECORDING_FILE)
         if data:
             playback.play(data)
     elif action == "stop":
@@ -2418,9 +2352,10 @@ frame_hub = FrameHub(width=PICAM_W, height=PICAM_H, fps=PICAM_FPS, jpeg_quality=
 @app.route("/video_feed")
 def video_feed():
     boundary = "frame"
-
     def generate():
         last_ts = 0.0
+        last_ov_compute = 0.0
+        min_dt = 1.0 / max(1.0, float(STREAM_OVERLAY_MAX_HZ))
         while True:
             jpg, ts = frame_hub.latest()
             if jpg is None:
@@ -2431,9 +2366,20 @@ def video_feed():
                 continue
             last_ts = ts
 
-            out_jpg = jpg
             try:
+<<<<<<< HEAD
+                if auto_state.get("line_follow_enabled"):
+                    # Recompute overlay on the current frame at a capped rate so signatures match.
+                    now = time()
+                    if _CV_ON and (now - last_ov_compute) >= min_dt:
+                        try:
+                            vision_detect_white_line(jpg)  # updates overlay cache for this exact frame
+                        except Exception:
+                            pass
+                        last_ov_compute = now
+=======
                 if cv2 and np and auto_state.get("line_follow_enabled"):
+>>>>>>> 0accc1d46621abf38b82c5ba4e6b5614b07f66b9
                     out_jpg = camera_overlay_from_cache(jpg)
                 else:
                     out_jpg = jpg
@@ -2441,20 +2387,13 @@ def video_feed():
                 out_jpg = jpg
 
             part = (
-                b"--" + boundary.encode("ascii") + b"\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(out_jpg)).encode("ascii") + b"\r\n"
-                b"Cache-Control: no-store\r\n\r\n" +
-                out_jpg + b"\r\n"
+                b"--" + boundary.encode("ascii") + b"\r\n" +
+                b"Content-Type: image/jpeg\r\n" +
+                b"Content-Length: " + str(len(out_jpg)).encode("ascii") + b"\r\n" +
+                b"Cache-Control: no-store\r\n\r\n" + out_jpg + b"\r\n"
             )
             yield part
-
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "X-Accel-Buffering": "no",
-    }
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "X-Accel-Buffering": "no"}
     return Response(generate(), mimetype=f"multipart/x-mixed-replace; boundary={boundary}", headers=headers)
 
 @app.route("/photos/<path:filename>")
